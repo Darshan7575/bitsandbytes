@@ -2268,8 +2268,9 @@ MAKE_OptimizerStaticReadam1D(float, 2, 256) MAKE_OptimizerStaticReadam1D(float, 
 
 #define MAKE_OptimizerStaticReadam(gtype, optim_bits, num_threads)                                                     \
     template __global__ void kOptimizerStaticReadam<gtype, optim_bits, num_threads>(                                   \
-        gtype * p, gtype* __restrict__ const g, unsigned char* state1, float* state2_row, float* state2_col,           \
-        float* state2_mean, const float beta1, const float beta2, const float eps, const int step, const float lr,     \
+        gtype * p, gtype* __restrict__ const g, unsigned char* state1, float* __restrict__ const state2_row,           \
+        float* __restrict__ const state2_col, float* __restrict__ const state2_mean, const float beta1,                \
+        const float beta2, const float eps, const int step, const float lr,                                            \
         float weight_decay, float decay_ratio, const float gnorm_scale, const bool skip_zeros, const int n,            \
         const int n_rows, const int n_cols, const int stride_full                                                      \
     );
