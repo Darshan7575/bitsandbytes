@@ -1323,6 +1323,387 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStatic8bit1StateBlockwise(
     }
 }
 
+// `vals` is the array of signed values containing `8/OPTIMIZER_BITS` entries which are packed into 1 byte.
+template <int OPTIMIZER_BITS>
+__device__ __forceinline__ float quantize_update(const float* vals, const bool* in_decay, const float eps) {
+
+    constexpr int NUM_MAG_BITS = OPTIMIZER_BITS - 1;
+    constexpr int TOTAL_MAG_VALS = 1 << NUM_MAG_BITS;
+    constexpr int HALF_MAG_VALS = TOTAL_MAG_VALS >> 1;
+    constexpr int NUM_LOG_VALS = HALF_MAG_VALS + 1;
+    constexpr int NUM_LIN_VALS = TOTAL_MAG_VALS - NUM_LOG_VALS;
+
+    unsigned char packed_byte = 0;
+
+#pragma unroll
+    for (int j = 0; j < (8 / OPTIMIZER_BITS); ++j) {
+        float val = vals[j];
+
+        bool is_negative = val < 0.0f;
+        float mag = fabsf(val);
+
+        // Clamp magnitude to [eps, 1.0f]
+        mag = fminf(fmaxf(mag, eps), 1.0f);
+
+        unsigned int mag_id = 0;
+
+        if (mag <= 0.1f) {
+            // Inverse of log scale: logf(eps) to logf(0.1f)
+            float t = (logf(mag) - logf(eps)) / (logf(0.1f) - logf(eps));
+            // Map t to discrete index in [0, NUM_LOG_VALS - 1]
+            mag_id = (unsigned int)roundf(t * (NUM_LOG_VALS - 1));
+            mag_id = min(mag_id, (unsigned int)(NUM_LOG_VALS - 1));
+        } else {
+            // Inverse of linear scale: above 0.1f to 1.0f
+            float t = (mag - 0.1f) / 0.9f;
+            // Map t to discrete index in [NUM_LOG_VALS, TOTAL_MAG_VALS - 1]
+            unsigned int lin_id = (unsigned int)roundf(t * NUM_LIN_VALS);
+            lin_id = min(lin_id, (unsigned int)(NUM_LIN_VALS - 1));
+            mag_id = NUM_LOG_VALS + lin_id;
+        }
+
+        // incase the coordinate is in the decay regime, move one step closer towards zero.
+        mag_id = (in_decay[j] && mag_id > 0) ? mag_id - 1 : mag_id;
+
+        // 3. Set sign bit in MSB of the b-bit value
+        unsigned char val_ind = (unsigned char)mag_id;
+        if (is_negative) {
+            val_ind |= TOTAL_MAG_VALS;
+        }
+
+        // 4. Pack into the byte using bitwise shift
+        packed_byte |= (val_ind << (j * OPTIMIZER_BITS));
+    }
+
+    return packed_byte;
+}
+
+// `packed_x` is the bit packed representation from which this function extracts and dequantizes `ind` element.
+template <int OPTIMIZER_BITS>
+__device__ __forceinline__ float dequantize_update(unsigned char packed_x, int ind, const float eps) {
+
+    constexpr unsigned char PACKED_MASK = (1 << OPTIMIZER_BITS) - 1;
+    constexpr int NUM_MAG_BITS = OPTIMIZER_BITS - 1;
+    constexpr int TOTAL_MAG_VALS = 1 << NUM_MAG_BITS;
+    constexpr int HALF_MAG_VALS = TOTAL_MAG_VALS >> 1;
+    constexpr unsigned char MAG_MASK = TOTAL_MAG_VALS - 1;
+
+    constexpr int NUM_LOG_VALS = HALF_MAG_VALS + 1;
+    constexpr int NUM_LIN_VALS = TOTAL_MAG_VALS - NUM_LOG_VALS;
+
+    float mag = 0.0f;
+    unsigned char val_ind = (packed_x >> (ind * OPTIMIZER_BITS)) & PACKED_MASK;
+
+    unsigned int mag_id = val_ind & MAG_MASK;
+    if (mag_id < NUM_LOG_VALS) {
+        // First half (Log scale): equally spaced from eps to 0.1, including 0.1
+        float t = (NUM_LOG_VALS <= 1) ? 0.0f : (float)mag_id / (NUM_LOG_VALS - 1);
+        mag = expf(logf(eps) + t * (logf(0.1f) - logf(eps)));
+    } else {
+        // Second half (Linear scale): equally spaced from above 0.1 to 1.0 (excluding 0.1)
+        unsigned int lin_id = mag_id - NUM_LOG_VALS;
+        float t = (NUM_LIN_VALS <= 1) ? 0.0f : (float)(lin_id + 1) / (NUM_LIN_VALS + 1);
+        mag = 0.1f + t * (1.0f - 0.1f);
+    }
+
+    // 4. Apply Sign (MSB holds sign)
+    mag = (val_ind & TOTAL_MAG_VALS) ? -mag : mag;
+
+    return mag;
+}
+
+#define LANES 2
+#define QUAD 3
+
+template <typename T, int OPTIMIZER_BITS, int NUM_THREADS>
+__launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam1D(
+    T* p, T* __restrict__ const g, unsigned char* state1, unsigned char* state2, const float beta1, const float beta2,
+    const float eps, const int step, const float lr, float* __restrict__ const quantiles2, float* absmax2,
+    float weight_decay, float decay_ratio, const float gnorm_scale, const bool skip_zeros, const int n
+) {
+
+    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
+    constexpr int BLOCK_SIZE = NUM_THREADS * N_PER_TH;
+    constexpr int ZERO_IND_STATE1 = 1 << (OPTIMIZER_BITS - 1);
+    constexpr int ZERO_IND_STATE2 = 128; // for 8 bit, this is the middle value, which indicates zero.
+
+    const int n_full = gridDim.x * BLOCK_SIZE;
+    const int base_idx = (blockIdx.x * BLOCK_SIZE);
+    int valid_items = 0;
+    int valid_items_packed = 0;
+    float z_val = 0.0f;
+    float s1_vals[N_PER_TH];
+    float s2_vals[N_PER_TH];
+    bool s1_in_decay[N_PER_TH];
+
+    const float at = __fdividef(1.0f - beta1, 1.0f - __powf(beta1, step));
+    const float bt = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step));
+    const int lane_id = threadIdx.x % LANES;
+    float new_local_abs_max2 = -FLT_MAX;
+    float quadrants2[QUAD];
+
+    unsigned char c1s[1]; // each thread always handles one value from state1, which contains bit packed values for
+                          // N_PER_TH number of elements.
+    unsigned char c2s[N_PER_TH];
+    T g_vals[N_PER_TH];
+    T p_vals[N_PER_TH];
+
+    // TODO (darshan): For ampere/hopper architectures, here we could use cp.async instructions to hide the memory
+    // latencies behind computations.
+    typedef bnb_cub::BlockLoad<T, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
+
+    typedef bnb_cub::BlockLoad<unsigned char, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadChar;
+    typedef bnb_cub::BlockLoad<unsigned char, NUM_THREADS, 1, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadCharPacked;
+
+    typedef bnb_cub::BlockStore<unsigned char, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreChar;
+    typedef bnb_cub::BlockStore<unsigned char, NUM_THREADS, 1, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreCharPacked;
+
+    typedef bnb_cub::BlockStore<T, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreT;
+
+    __shared__ float smem_quantiles2[LANES][257];
+    typedef bnb_cub::BlockReduce<float, NUM_THREADS> BlockReduce2;
+    __shared__ typename BlockReduce2::TempStorage reduce2;
+    __shared__ float smem_exchange2[1];
+
+    __shared__ union {
+        typename LoadT::TempStorage loadh;
+        typename LoadChar::TempStorage loadc;
+        typename LoadCharPacked::TempStorage loadcpacked;
+        typename StoreChar::TempStorage storec;
+        typename StoreCharPacked::TempStorage storecpacked;
+        typename StoreT::TempStorage storeh;
+    } temp_storage;
+
+    // init: 0.2 -> 0.23
+
+    // 0.23 -> 0.23
+    smem_quantiles2[0][threadIdx.x] = quantiles2[threadIdx.x];
+#pragma unroll
+    for (unsigned int j = 1; j < LANES; j++)
+        smem_quantiles2[j][threadIdx.x] = smem_quantiles2[0][threadIdx.x];
+
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < QUAD; k++)
+        quadrants2[k] = smem_quantiles2[lane_id][(k * 256 / (QUAD + 1)) + (256 / (QUAD + 1) - 1)];
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        unsigned int i_packed = i / N_PER_TH;
+        // loads: 0.23 -> 0.85/1.44
+        valid_items = n - i >= BLOCK_SIZE ? BLOCK_SIZE : n - i;
+        valid_items_packed = (valid_items + N_PER_TH - 1) / N_PER_TH;
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(g[i]), g_vals, valid_items, (T)0.0f);
+        __syncthreads();
+        LoadCharPacked(temp_storage.loadcpacked).Load(&(state1[i_packed]), c1s, valid_items_packed, ZERO_IND_STATE1);
+        __syncthreads();
+        LoadChar(temp_storage.loadc).Load(&(state2[i]), c2s, valid_items, ZERO_IND_STATE2);
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(p[i]), p_vals, valid_items, (T)0.0f);
+
+        new_local_abs_max2 = -FLT_MAX;
+
+//  update: 2.48/1.57 -> 2.51/1.60
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
+                s2_vals[j] = smem_quantiles2[lane_id][c2s[j]] * absmax2[i / BLOCK_SIZE];
+
+                z_val = __fdividef(g_vals[j], s2_vals[j] + eps);
+
+                float denom = sqrtf(1 - bt + (bt * z_val * z_val));
+
+                s1_vals[j] = __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), denom + eps);
+                s2_vals[j] = (s2_vals[j] == 0.0f) ? (sqrtf(bt) * fabsf(g_vals[j])) : s2_vals[j] * denom;
+
+                s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+
+            } else {
+                s1_vals[j] = 0.0f;
+                s2_vals[j] = 0.0f;
+                s1_in_decay[j] = false;
+            }
+
+            new_local_abs_max2 = fmaxf(new_local_abs_max2, fabsf(s2_vals[j]));
+        }
+
+        new_local_abs_max2 = BlockReduce2(reduce2).Reduce(new_local_abs_max2, BNB_MAX_OP);
+
+        if (threadIdx.x == 0)
+            smem_exchange2[0] = new_local_abs_max2;
+
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+            absmax2[i / BLOCK_SIZE] = new_local_abs_max2;
+        else
+            new_local_abs_max2 = smem_exchange2[0];
+
+        __syncthreads();
+
+//  reduce: 2.67/1.69 -> 2.67/1.70
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                p_vals[j] = (T)(((float)p_vals[j]) - lr * s1_vals[j]);
+            }
+
+            if (weight_decay > 0.0f)
+                p_vals[j] = ((float)p_vals[j]) * (1.0f - (lr * weight_decay));
+        }
+
+        //  store: 0.85/1.44 -> 2.48/1.57
+        __syncthreads();
+        StoreT(temp_storage.storeh).Store(&(p[i]), p_vals, valid_items);
+
+        //  quantizaztion: 2.67/1.70  -> 3.4/3.3
+        c1s[0] = quantize_update<OPTIMIZER_BITS>(s1_vals, s1_in_decay, eps);
+        __syncthreads();
+        StoreCharPacked(temp_storage.storecpacked).Store(&(state1[i_packed]), c1s, valid_items_packed);
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            c2s[j] = quantize_2D<1>(quadrants2, smem_quantiles2[lane_id], __fdividef(s2_vals[j], new_local_abs_max2));
+        }
+        __syncthreads();
+        StoreChar(temp_storage.storec).Store(&(state2[i]), c2s, valid_items);
+    }
+}
+
+template <typename T, int OPTIMIZER_BITS, int NUM_THREADS>
+__launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
+    T* p, T* __restrict__ const g, unsigned char* state1, float* __restrict__ const state2_row,
+    float* __restrict__ const state2_col, float* __restrict__ const state2_mean, const float beta1, const float beta2,
+    const float eps, const int step, const float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
+    const bool skip_zeros, const int n, const int n_rows, const int n_cols, const int stride_full
+) {
+    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
+    constexpr int BLOCK_SIZE = NUM_THREADS * N_PER_TH;
+    constexpr int ZERO_IND = 1 << (OPTIMIZER_BITS - 1);
+
+    const int n_full = gridDim.x * BLOCK_SIZE;
+    const int base_idx = (blockIdx.x * BLOCK_SIZE);
+
+    int valid_items = 0;
+    int valid_items_packed = 0;
+    float z_val = 0.0f;
+    float s1_vals[N_PER_TH];
+    float s2_val;
+    bool s1_in_decay[N_PER_TH];
+
+    const float at = __fdividef(1.0f - beta1, 1.0f - __powf(beta1, step));
+    const float bt_prev = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step - 1));
+    const float bt = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step));
+    const float eps_sq = eps * eps;
+
+    unsigned char c1s[1]; // each thread always handles one value from state1, which contains bit packed values for
+                          // N_PER_TH number of elements.
+    T g_vals[N_PER_TH];
+    T p_vals[N_PER_TH];
+
+    // TODO (darshan): For ampere/hopper architectures, here we could use cp.async instructions to hide the memory
+    // latencies behind computations.
+    typedef bnb_cub::BlockLoad<T, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
+    typedef bnb_cub::BlockStore<T, NUM_THREADS, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreT;
+
+    typedef bnb_cub::BlockLoad<unsigned char, NUM_THREADS, 1, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadCharPacked;
+    typedef bnb_cub::BlockStore<unsigned char, NUM_THREADS, 1, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreCharPacked;
+
+    __shared__ union {
+        typename LoadT::TempStorage loadh;
+        typename LoadCharPacked::TempStorage loadcpacked;
+        typename StoreCharPacked::TempStorage storecpacked;
+        typename StoreT::TempStorage storeh;
+    } temp_storage;
+
+    // init: 0.2 -> 0.23
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        const int thread_base_idx = i + (threadIdx.x * N_PER_TH);
+        int batch_idx = thread_base_idx / stride_full;
+        int state2_row_idx =
+            thread_base_idx /
+            n_cols; // simplifying the calculations leads to this simple formula to find start idx of row.
+        int state2_col_base_idx = (batch_idx * n_cols);
+        int state2_col_idx = (thread_base_idx % n_cols);
+
+        float row_val = __ldg(&state2_row[state2_row_idx]);
+        float mean_val = __ldg(&state2_mean[batch_idx]);
+
+        unsigned int i_packed = i / N_PER_TH;
+        // loads: 0.23 -> 0.85/1.44
+        valid_items = n - i >= BLOCK_SIZE ? BLOCK_SIZE : n - i;
+        valid_items_packed = (valid_items + N_PER_TH - 1) / N_PER_TH;
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(g[i]), g_vals, valid_items, (T)0.0f);
+        __syncthreads();
+        LoadCharPacked(temp_storage.loadcpacked).Load(&(state1[i_packed]), c1s, valid_items_packed, ZERO_IND);
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(p[i]), p_vals, valid_items, (T)0.0f);
+        __syncthreads();
+
+//  update: 2.48/1.57 -> 2.51/1.60
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (j > 0) {
+                state2_col_idx++;
+                if (state2_col_idx == n_cols) {
+                    state2_col_idx = 0;
+                    state2_row_idx++;
+                    // Update batch_idx only if we cross a batch boundary (each batch has n_rows rows)
+                    batch_idx = state2_row_idx / n_rows;
+                    state2_col_base_idx = (batch_idx * n_cols);
+
+                    row_val = __ldg(&state2_row[state2_row_idx]);
+                    mean_val = __ldg(&state2_mean[batch_idx]);
+                }
+            }
+
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
+
+                // Here, we use the equations from algorithm 2 of the original Adafactor paper to reconstruct state2. We
+                // do not use any advanced update clipping mechanisms that the original paper proposes in section 6.
+                s2_val = __fdividef(
+                    row_val * __ldg(&state2_col[state2_col_base_idx + state2_col_idx]), mean_val + eps_sq
+                ); // pytorch adafactor implementation uses eps1 instead of eps^2, which is passed as additional
+                   // argument.
+                s2_val = sqrtf(__fdividef(s2_val, bt_prev));
+
+                z_val = __fdividef(g_vals[j], s2_val + eps);
+
+                s1_vals[j] =
+                    __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps);
+                s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+            } else {
+                s1_vals[j] = 0.0f;
+                s1_in_decay[j] = false;
+            }
+        }
+
+//  reduce: 2.67/1.69 -> 2.67/1.70
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                p_vals[j] = (T)(((float)p_vals[j]) - lr * s1_vals[j]);
+            }
+
+            if (weight_decay > 0.0f)
+                p_vals[j] = ((float)p_vals[j]) * (1.0f - (lr * weight_decay));
+        }
+
+        //  store: 0.85/1.44 -> 2.48/1.57
+        __syncthreads();
+        StoreT(temp_storage.storeh).Store(&(p[i]), p_vals, valid_items);
+
+        //  quantizaztion: 2.67/1.70  -> 3.4/3.3
+        c1s[0] = quantize_update<OPTIMIZER_BITS>(s1_vals, s1_in_decay, eps);
+        __syncthreads();
+        StoreCharPacked(temp_storage.storecpacked).Store(&(state1[i_packed]), c1s, valid_items_packed);
+    }
+}
+
 // Inputs:
 //  A [rows, cols]
 // Outputs:
@@ -1861,3 +2242,27 @@ MAKE_OptimizerStatic8bit1StateBlockwise(LION, bnb_bfloat16, 256, 1)
 MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, float, 256, 1)
 MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, half, 256, 1)
 MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, bnb_bfloat16, 256, 1)
+
+#define MAKE_OptimizerStaticReadam1D(gtype, optim_bits, num_threads)                                                   \
+    template __global__ void kOptimizerStaticReadam1D<gtype, optim_bits, num_threads>(                                 \
+        gtype * p, gtype* __restrict__ const g, unsigned char* state1, unsigned char* state2, const float beta1,       \
+        const float beta2, const float eps, const int step, const float lr, float* __restrict__ const quantiles2,      \
+        float* absmax2, float weight_decay, float decay_ratio, const float gnorm_scale, const bool skip_zeros,         \
+        const int n                                                                                                    \
+    );
+
+MAKE_OptimizerStaticReadam1D(float, 2, 256) MAKE_OptimizerStaticReadam1D(float, 4, 256) MAKE_OptimizerStaticReadam1D(float, 8, 256) MAKE_OptimizerStaticReadam1D(half, 2, 256) MAKE_OptimizerStaticReadam1D(
+    half, 4, 256
+) MAKE_OptimizerStaticReadam1D(half, 8, 256) MAKE_OptimizerStaticReadam1D(bnb_bfloat16, 2, 256) MAKE_OptimizerStaticReadam1D(bnb_bfloat16, 4, 256) MAKE_OptimizerStaticReadam1D(bnb_bfloat16, 8, 256)
+
+#define MAKE_OptimizerStaticReadam(gtype, optim_bits, num_threads)                                                     \
+    template __global__ void kOptimizerStaticReadam<gtype, optim_bits, num_threads>(                                   \
+        gtype * p, gtype* __restrict__ const g, unsigned char* state1, float* state2_row, float* state2_col,           \
+        float* state2_mean, const float beta1, const float beta2, const float eps, const int step, const float lr,     \
+        float weight_decay, float decay_ratio, const float gnorm_scale, const bool skip_zeros, const int n,            \
+        const int n_rows, const int n_cols, const int stride_full                                                      \
+    );
+
+    MAKE_OptimizerStaticReadam(float, 2, 256) MAKE_OptimizerStaticReadam(float, 4, 256) MAKE_OptimizerStaticReadam(float, 8, 256) MAKE_OptimizerStaticReadam(half, 2, 256) MAKE_OptimizerStaticReadam(
+        half, 4, 256
+    ) MAKE_OptimizerStaticReadam(half, 8, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 2, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 4, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 8, 256)

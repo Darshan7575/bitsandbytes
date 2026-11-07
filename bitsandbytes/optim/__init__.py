@@ -18,5 +18,15 @@ from .lamb import LAMB, LAMB8bit, LAMB32bit
 from .lars import LARS, LARS8bit, LARS32bit, PytorchLARS
 from .lion import Lion, Lion8bit, Lion32bit, PagedLion, PagedLion8bit, PagedLion32bit
 from .optimizer import GlobalOptimManager
+from .readam import (
+    PagedReAdamW,
+    PagedReAdamW2bit,
+    PagedReAdamW4bit,
+    PagedReAdamW8bit,
+    ReAdamW,
+    ReAdamW2bit,
+    ReAdamW4bit,
+    ReAdamW8bit,
+)
 from .rmsprop import RMSprop, RMSprop8bit, RMSprop32bit
 from .sgd import SGD, SGD8bit, SGD32bit

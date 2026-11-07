@@ -191,6 +191,44 @@ void optimizerStatic8bitBlockwise(
     }
 }
 
+#define NUM_THREADS_READAM 256
+
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadam1D(
+    T* p, T* g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float eps, int step, float lr,
+    float* quantiles2, float* absmax2, float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros,
+    int n
+) {
+    // each thread will handle 1 byte of state1 (U in our case) and whatever corresponding number of elements for
+    // state2. For example, if OPTIMIZER_BITS=2, then each thread will handle 1 entry of state1 which will have values
+    // corresponding to 4 parameter entries (bit packed) and 4 values from state2 since state2 is 8 bit quantized.
+    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
+    int num_blocks = (n + N_PER_TH - 1) / (N_PER_TH * NUM_THREADS_READAM); // handle bit packing for 2 and 4 bits
+
+    kOptimizerStaticReadam1D<T, OPTIMIZER_BITS, NUM_THREADS_READAM><<<num_blocks, NUM_THREADS_READAM>>>(
+        p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay, decay_ratio, gnorm_scale,
+        skip_zeros, n
+    );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadam(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float beta1,
+    float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
+    bool skip_zeros, int n, int n_rows, int n_cols
+) {
+    int total_bytes = (n * OPTIMIZER_BITS + 7) / 8; // handle bit packing for 2 and 4 bits
+    int num_blocks = (total_bytes + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
+    int stride_full = n_rows * n_cols;
+
+    kOptimizerStaticReadam<T, OPTIMIZER_BITS, NUM_THREADS_READAM><<<num_blocks, NUM_THREADS_READAM>>>(
+        p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr, weight_decay, decay_ratio,
+        gnorm_scale, skip_zeros, n, n_rows, n_cols, stride_full
+    );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
 void gemmex(
     Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
     int ldb, int ldc
@@ -600,3 +638,37 @@ MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, ADAGRAD);
 MAKE_optimizerStatic8bitBlockwise(half, ADEMAMIX);
 MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, ADEMAMIX);
 MAKE_optimizerStatic8bitBlockwise(float, ADEMAMIX);
+
+#define MAKE_optimizerStaticReadam1D(gtype, optim_bits)                                                                \
+    template void optimizerStaticReadam1D<gtype, optim_bits>(                                                          \
+        gtype * p, gtype * g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float eps,       \
+        int step, float lr, float* quantiles2, float* absmax2, float weight_decay, float decay_ratio,                  \
+        const float gnorm_scale, bool skip_zeros, int n                                                                \
+    );
+
+MAKE_optimizerStaticReadam1D(half, 2);
+MAKE_optimizerStaticReadam1D(half, 4);
+MAKE_optimizerStaticReadam1D(half, 8);
+MAKE_optimizerStaticReadam1D(float, 2);
+MAKE_optimizerStaticReadam1D(float, 4);
+MAKE_optimizerStaticReadam1D(float, 8);
+MAKE_optimizerStaticReadam1D(bnb_bfloat16, 2);
+MAKE_optimizerStaticReadam1D(bnb_bfloat16, 4);
+MAKE_optimizerStaticReadam1D(bnb_bfloat16, 8);
+
+#define MAKE_optimizerStaticReadam(gtype, optim_bits)                                                                  \
+    template void optimizerStaticReadam<gtype, optim_bits>(                                                            \
+        gtype * p, gtype * g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,         \
+        float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,                \
+        const float gnorm_scale, bool skip_zeros, int n, int n_rows, int n_cols                                        \
+    );
+
+MAKE_optimizerStaticReadam(half, 2);
+MAKE_optimizerStaticReadam(half, 4);
+MAKE_optimizerStaticReadam(half, 8);
+MAKE_optimizerStaticReadam(float, 2);
+MAKE_optimizerStaticReadam(float, 4);
+MAKE_optimizerStaticReadam(float, 8);
+MAKE_optimizerStaticReadam(bnb_bfloat16, 2);
+MAKE_optimizerStaticReadam(bnb_bfloat16, 4);
+MAKE_optimizerStaticReadam(bnb_bfloat16, 8);

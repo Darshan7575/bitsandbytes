@@ -1208,5 +1208,123 @@ def _optimizer_update_8bit_blockwise_impl(
         )
 
 
+def _optimizer_update_readam_1D_impl(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap2: torch.Tensor,
+    absmax2: torch.Tensor,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    optimizer_fns = (
+        lib.creadam_1D_grad_fp32,
+        lib.creadam_1D_grad_fp16,
+        lib.creadam_1D_grad_bf16,
+    )
+
+    if g.dtype == torch.float32:
+        optimizer_fn = optimizer_fns[0]
+    elif g.dtype == torch.float16:
+        optimizer_fn = optimizer_fns[1]
+    elif g.dtype == torch.bfloat16:
+        optimizer_fn = optimizer_fns[2]
+    else:
+        raise ValueError(
+            f"Unsupported gradient dtype: {g.dtype}. Supported dtypes: torch.float32, torch.float16, torch.bfloat16"
+        )
+
+    with _cuda_device_of(g):
+        optimizer_fn(
+            get_ptr(p),
+            get_ptr(g),
+            get_ptr(state1),
+            get_ptr(state2),
+            ct.c_int32(optim_bits),
+            ct.c_float(beta1),
+            ct.c_float(beta2),
+            ct.c_float(eps),
+            ct.c_int32(step),
+            ct.c_float(lr),
+            get_ptr(qmap2),
+            get_ptr(absmax2),
+            ct.c_float(weight_decay),
+            ct.c_float(decay_ratio),
+            ct.c_float(gnorm_scale),
+            ct.c_bool(skip_zeros),
+            ct.c_int32(g.numel()),
+        )
+
+
+def _optimizer_update_readam_impl(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    optimizer_fns = (
+        lib.creadam_grad_fp32,
+        lib.creadam_grad_fp16,
+        lib.creadam_grad_bf16,
+    )
+
+    if g.dtype == torch.float32:
+        optimizer_fn = optimizer_fns[0]
+    elif g.dtype == torch.float16:
+        optimizer_fn = optimizer_fns[1]
+    elif g.dtype == torch.bfloat16:
+        optimizer_fn = optimizer_fns[2]
+    else:
+        raise ValueError(
+            f"Unsupported gradient dtype: {g.dtype}. Supported dtypes: torch.float32, torch.float16, torch.bfloat16"
+        )
+
+    with _cuda_device_of(g):
+        optimizer_fn(
+            get_ptr(p),
+            get_ptr(g),
+            get_ptr(state1),
+            get_ptr(state2_row),
+            get_ptr(state2_col),
+            get_ptr(state2_mean),
+            ct.c_int32(optim_bits),
+            ct.c_float(beta1),
+            ct.c_float(beta2),
+            ct.c_float(eps),
+            ct.c_int32(step),
+            ct.c_float(lr),
+            ct.c_float(weight_decay),
+            ct.c_float(decay_ratio),
+            ct.c_float(gnorm_scale),
+            ct.c_bool(skip_zeros),
+            ct.c_int32(g.numel()),
+            ct.c_int32(g.size(-2)),
+            ct.c_int32(g.size(-1)),
+        )
+
+
 register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "cuda")(_optimizer_update_8bit_blockwise_impl)
+register_kernel("bitsandbytes::optimizer_update_readam_1D", "cuda")(_optimizer_update_readam_1D_impl)
+register_kernel("bitsandbytes::optimizer_update_readam", "cuda")(_optimizer_update_readam_impl)
 register_kernel("bitsandbytes::optimizer_update_32bit", "cuda")(_optimizer_update_32bit_impl)

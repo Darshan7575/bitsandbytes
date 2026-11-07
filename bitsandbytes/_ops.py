@@ -508,3 +508,105 @@ def _(
             qmap2.dtype == absmax2.dtype == torch.float32,
             lambda: f"Expected qmap2 and absmax2 to be float32, got qmap2.dtype={qmap2.dtype}, absmax2.dtype={absmax2.dtype}",
         )
+
+
+torch.library.define(
+    "bitsandbytes::optimizer_update_readam_1D",
+    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2, int optim_bits, float beta1, float beta2, float eps, int step, float lr, Tensor(a4!) qmap2, Tensor(a5!) absmax2, float weight_decay, float decay_ratio, float gnorm_scale, bool skip_zeros=False) -> ()",
+)
+
+
+@register_fake("bitsandbytes::optimizer_update_readam_1D")
+def _(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap2: torch.Tensor,
+    absmax2: torch.Tensor,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    torch._check(
+        g.numel() == p.numel(),
+        lambda: f"g and p must have the same number of elements, got {g.numel()} and {p.numel()}",
+    )
+    compute_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
+    torch._check(
+        g.dtype in compute_dtypes,
+        lambda: f"g must be bfloat16, float16, or float32, got {g.dtype}",
+    )
+    torch._check(
+        g.dtype == p.dtype,
+        lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    )
+    torch._check(
+        state1.dtype == torch.uint8,
+        lambda: f"state1 must be uint8, got {state1.dtype}",
+    )
+    torch._check(
+        state2.dtype == torch.uint8,
+        lambda: f"state2 must be uint8, got {state2.dtype}",
+    )
+    torch._check(
+        qmap2.dtype == absmax2.dtype == torch.float32,
+        lambda: f"Expected qmap2 and absmax2 to be float32, got qmap2.dtype={qmap2.dtype}, absmax2.dtype={absmax2.dtype}",
+    )
+
+
+torch.library.define(
+    "bitsandbytes::optimizer_update_readam",
+    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2_row, Tensor(a4!) state2_col, Tensor(a5!) state2_mean, int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, float gnorm_scale, bool skip_zeros=False) -> ()",
+)
+
+
+@register_fake("bitsandbytes::optimizer_update_readam")
+def _(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    torch._check(
+        g.numel() == p.numel(),
+        lambda: f"g and p must have the same number of elements, got {g.numel()} and {p.numel()}",
+    )
+    compute_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
+    torch._check(
+        g.dtype in compute_dtypes,
+        lambda: f"g must be bfloat16, float16, or float32, got {g.dtype}",
+    )
+    torch._check(
+        g.dtype == p.dtype,
+        lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    )
+    torch._check(
+        state1.dtype == torch.uint8,
+        lambda: f"state1 must be uint8, got {state1.dtype}",
+    )
+    torch._check(
+        state2_row.dtype == state2_col.dtype == state2_mean.dtype == torch.float32,
+        lambda: f"Expected state2_row, state2_col and state2_mean to be float32, got state2_row.dtype={state2_row.dtype}, state2_col.dtype={state2_col.dtype}, state2_mean.dtype={state2_mean.dtype}",
+    )

@@ -115,6 +115,20 @@ void optimizerStatic8bitBlockwise(
     float weight_decay, const float gnorm_scale, bool skip_zeros, int n
 );
 
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadam1D(
+    T* p, T* g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float eps, int step, float lr,
+    float* quantiles2, float* absmax2, float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros,
+    int n
+);
+
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadam(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float beta1,
+    float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
+    bool skip_zeros, int n, int n_rows, int n_cols
+);
+
 void gemmex(
     Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
     int ldb, int ldc

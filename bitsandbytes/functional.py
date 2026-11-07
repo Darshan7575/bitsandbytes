@@ -1212,6 +1212,96 @@ def optimizer_update_8bit_blockwise(
     )
 
 
+def optimizer_update_readam_1D(
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor,
+    state2: Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap2: Tensor,
+    absmax2: Tensor,
+    weight_decay: float = 0.0,
+    decay_ratio: float = 10.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    is_on_gpu([p, g, state1, state2, qmap2, absmax2])
+
+    torch.ops.bitsandbytes.optimizer_update_readam_1D(
+        g,
+        p,
+        state1,
+        state2,
+        optim_bits,
+        beta1,
+        beta2,
+        eps,
+        step,
+        lr,
+        qmap2,
+        absmax2,
+        weight_decay,
+        decay_ratio,
+        gnorm_scale,
+        skip_zeros,
+    )
+
+
+def optimizer_update_readam(
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor,
+    state2_row: Tensor,
+    state2_col: Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    decay_ratio: float = 10.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    """
+    NOTE: Here, we deliberately chose to split ReAdam's operations into (1) a custom kernel that updates weight and U (state1), and (2) a native torch
+    implementation that updates adafactor's statistics. We do this because designing a thread launch configuration that can cater to all weight shapes
+    such as lean matrices, and perform the reduction over both row and column causes thread under-utilization, requires collaborative writes across
+    thread-blocks, and needs extra memory. Overall, separating felt a more logical choice which keeps the code simple and clean, and has minimal overhead.
+    """
+    is_on_gpu([p, g, state1, state2_row, state2_col])
+
+    torch.ops.bitsandbytes.optimizer_update_readam(
+        g,
+        p,
+        state1,
+        state2_row,
+        state2_col,
+        state2_row.mean(dim=-2),
+        optim_bits,
+        beta1,
+        beta2,
+        eps,
+        step,
+        lr,
+        weight_decay,
+        decay_ratio,
+        gnorm_scale,
+        skip_zeros,
+    )
+
+    # updating adafactor's statistics. (borrowed from: https://github.com/pytorch/pytorch/blob/v2.14.0/torch/optim/_adafactor.py)
+    one_minus_beta2 = step**beta2
+    state2_row.lerp_(torch.linalg.vector_norm(g, dim=-1, keepdim=True).square_().div_(g.size(-1)), one_minus_beta2)
+    state2_col.lerp_(torch.linalg.vector_norm(g, dim=-2, keepdim=True).square_().div_(g.size(-2)), one_minus_beta2)
+
+
 @deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)
 def check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8):
     if not torch.cuda.is_initialized():

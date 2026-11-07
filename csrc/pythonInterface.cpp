@@ -124,6 +124,98 @@ MAKE_BLOCKWISE8(ademamix, ADEMAMIX, half, fp16)
 MAKE_BLOCKWISE8(ademamix, ADEMAMIX, bnb_bfloat16, bf16)
 MAKE_BLOCKWISE8(ademamix, ADEMAMIX, float, fp32)
 
+// #define MAKE_READAM_1D(gtype, gbits)                                                                                \
+//     void readam_1D_grad_##gbits(                                                                                    \
+//         gtype* p, gtype* g, unsigned char* state1, unsigned char* state2, int optim_bits, float beta1,              \
+//         float beta2, float eps, int step, float lr, float* quantiles2, float* absmax2, float weight_decay,          \
+//         float decay_ratio, const float gnorm_scale, bool skip_zeros, int n                                          \
+//     ) {                                                                                                             \
+//         optimizerStaticReadam1D<gtype, optim_bits>(                                                                 \
+//             p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2,                                 \
+//             weight_decay, decay_ratio, gnorm_scale, skip_zeros, n                                                   \
+//         );                                                                                                          \
+//     }
+
+#define MAKE_READAM_1D(gtype, gbits)                                                                                   \
+    void readam_1D_grad_##gbits(                                                                                       \
+        gtype* p, gtype* g, unsigned char* state1, unsigned char* state2, int optim_bits, float beta1, float beta2,    \
+        float eps, int step, float lr, float* quantiles2, float* absmax2, float weight_decay, float decay_ratio,       \
+        const float gnorm_scale, bool skip_zeros, int n                                                                \
+    ) {                                                                                                                \
+        switch (optim_bits) {                                                                                          \
+        case 2:                                                                                                        \
+            optimizerStaticReadam1D<gtype, 2>(                                                                         \
+                p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay, decay_ratio,     \
+                gnorm_scale, skip_zeros, n                                                                             \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 4:                                                                                                        \
+            optimizerStaticReadam1D<gtype, 4>(                                                                         \
+                p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay, decay_ratio,     \
+                gnorm_scale, skip_zeros, n                                                                             \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 8:                                                                                                        \
+            optimizerStaticReadam1D<gtype, 8>(                                                                         \
+                p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay, decay_ratio,     \
+                gnorm_scale, skip_zeros, n                                                                             \
+            );                                                                                                         \
+            break;                                                                                                     \
+        default:                                                                                                       \
+            throw std::runtime_error("optimizer_bits must be 2, 4, or 8, got " + std::to_string(optim_bits));          \
+        }                                                                                                              \
+    }
+
+MAKE_READAM_1D(half, fp16)
+MAKE_READAM_1D(bnb_bfloat16, bf16)
+MAKE_READAM_1D(float, fp32)
+
+// #define MAKE_READAM(gtype, gbits)                                                                                  \
+//     void readam_grad_##gbits(                                                                                      \
+//         gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,       \
+//         int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay,               \
+//         float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_rows, int n_cols                 \
+//     ) {                                                                                                            \
+//         optimizerStaticReadam<gtype, optim_bits>(                                                                  \
+//             p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr,                        \
+//             weight_decay, decay_ratio, gnorm_scale, skip_zeros, n, n_rows, n_cols                                  \
+//         );                                                                                                         \
+//     }
+
+#define MAKE_READAM(gtype, gbits)                                                                                      \
+    void readam_grad_##gbits(                                                                                          \
+        gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
+        int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay,                   \
+        float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_rows, int n_cols                     \
+    ) {                                                                                                                \
+        switch (optim_bits) {                                                                                          \
+        case 2:                                                                                                        \
+            optimizerStaticReadam<gtype, 2>(                                                                           \
+                p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr, weight_decay,          \
+                decay_ratio, gnorm_scale, skip_zeros, n, n_rows, n_cols                                                \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 4:                                                                                                        \
+            optimizerStaticReadam<gtype, 4>(                                                                           \
+                p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr, weight_decay,          \
+                decay_ratio, gnorm_scale, skip_zeros, n, n_rows, n_cols                                                \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 8:                                                                                                        \
+            optimizerStaticReadam<gtype, 8>(                                                                           \
+                p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr, weight_decay,          \
+                decay_ratio, gnorm_scale, skip_zeros, n, n_rows, n_cols                                                \
+            );                                                                                                         \
+            break;                                                                                                     \
+        default:                                                                                                       \
+            throw std::runtime_error("optimizer_bits must be 2, 4, or 8, got " + std::to_string(optim_bits));          \
+        }                                                                                                              \
+    }
+
+MAKE_READAM(half, fp16)
+MAKE_READAM(bnb_bfloat16, bf16)
+MAKE_READAM(float, fp32)
+
 void quantizeBlockwise_fp16(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
     quantizeBlockwise<half, 0, General8bit>(code, A, absmax, out, nullptr, 0, blocksize, n);
 }
@@ -502,6 +594,38 @@ MAKE_CBLOCKWISE8(lion, LION, bnb_bfloat16, bf16)
 MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, half, fp16)
 MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, float, fp32)
 MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, bnb_bfloat16, bf16)
+
+#define MAKE_CREADAM_1D(gtype, gbits)                                                                                  \
+    void creadam_1D_grad_##gbits(                                                                                      \
+        gtype* p, gtype* g, unsigned char* state1, unsigned char* state2, int optim_bits, float beta1, float beta2,    \
+        float eps, int step, float lr, float* quantiles2, float* absmax2, float weight_decay, float decay_ratio,       \
+        const float gnorm_scale, bool skip_zeros, int n                                                                \
+    ) {                                                                                                                \
+        readam_1D_grad_##gbits(                                                                                        \
+            p, g, state1, state2, optim_bits, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay,          \
+            decay_ratio, gnorm_scale, skip_zeros, n                                                                    \
+        );                                                                                                             \
+    }
+
+MAKE_CREADAM_1D(half, fp16)
+MAKE_CREADAM_1D(float, fp32)
+MAKE_CREADAM_1D(bnb_bfloat16, bf16)
+
+#define MAKE_CREADAM(gtype, gbits)                                                                                     \
+    void creadam_grad_##gbits(                                                                                         \
+        gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
+        int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay,                   \
+        float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_rows, int n_cols                     \
+    ) {                                                                                                                \
+        readam_grad_##gbits(                                                                                           \
+            p, g, state1, state2_row, state2_col, state2_mean, optim_bits, beta1, beta2, eps, step, lr, weight_decay,  \
+            decay_ratio, gnorm_scale, skip_zeros, n, n_rows, n_cols                                                    \
+        );                                                                                                             \
+    }
+
+MAKE_CREADAM(half, fp16)
+MAKE_CREADAM(float, fp32)
+MAKE_CREADAM(bnb_bfloat16, bf16)
 
 void cigemm(
     Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
