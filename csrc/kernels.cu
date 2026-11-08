@@ -1495,17 +1495,24 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam1D(
 #pragma unroll N_PER_TH
         for (unsigned int j = 0; j < N_PER_TH; j++) {
             if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
-                s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
-                s2_vals[j] = smem_quantiles2[lane_id][c2s[j]] * absmax2[i / BLOCK_SIZE];
+                if (step == 1) {
+                    const float g_f = (float)g_vals[j];
+                    s1_vals[j] = (float)((g_f > 0.0f) - (g_f < 0.0f));
+                    s2_vals[j] = (sqrtf(bt) * fabsf(g_vals[j]));
+                    s1_in_decay[j] = false;
+                } else {
+                    s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
+                    s2_vals[j] = smem_quantiles2[lane_id][c2s[j]] * absmax2[i / BLOCK_SIZE];
 
-                z_val = __fdividef(g_vals[j], s2_vals[j] + eps);
+                    z_val = __fdividef(g_vals[j], s2_vals[j] + eps);
 
-                float denom = sqrtf(1 - bt + (bt * z_val * z_val));
+                    float denom = sqrtf(1.0f - bt + (bt * z_val * z_val));
 
-                s1_vals[j] = __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), denom + eps);
-                s2_vals[j] = (s2_vals[j] == 0.0f) ? (sqrtf(bt) * fabsf(g_vals[j])) : s2_vals[j] * denom;
+                    s1_vals[j] = __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), denom + eps);
+                    s2_vals[j] = (s2_vals[j] == 0.0f) ? (sqrtf(bt) * fabsf(g_vals[j])) : (s2_vals[j] * denom);
 
-                s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
+                    s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
+                }
 
             } else {
                 s1_vals[j] = 0.0f;

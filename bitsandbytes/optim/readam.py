@@ -55,6 +55,7 @@ class OptimizerQuantized(BaseOptimizer8bit):
         config["lr"] = group["lr"]
         config["optim_bits"] = self.args.optim_bits
         config["decay_ratio"] = self.args.decay_ratio
+        config["adafactor"] = self.args.adafactor
         config["min_quant_size"] = self.args.min_quant_size
         config["max_unorm"] = self.args.max_unorm
         config["skip_zeros"] = self.args.skip_zeros
@@ -126,6 +127,7 @@ class Optimizer2State(OptimizerQuantized):
         weight_decay=0.0,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         max_unorm=0.0,
@@ -152,6 +154,8 @@ class Optimizer2State(OptimizerQuantized):
                 The number of bits of the optimizer state. Should be one of [2, 4, 8].
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -186,6 +190,7 @@ class Optimizer2State(OptimizerQuantized):
             args = {}
             args["optim_bits"] = optim_bits
             args["decay_ratio"] = decay_ratio
+            args["adafactor"] = adafactor
             args["min_quant_size"] = min_quant_size
             args["max_unorm"] = max_unorm
             args["skip_zeros"] = skip_zeros
@@ -209,15 +214,12 @@ class Optimizer2State(OptimizerQuantized):
         if p.numel() >= config["min_quant_size"]:
             state["state1"] = self.get_state_buffer(p, dtype=torch.uint8, optim_bits=config["optim_bits"])
 
-            if p.dim() > 1:
+            if (p.dim() > 1) and config["adafactor"]:
                 # do adafactor compression only if the param is not 1D and has size greater than the minimum size required for quantization
                 # TODO (darshan): In theory, these row/column stats can be quantized, but the memory gain is very marginal with additional compute overhead, and is not worth the effort.
                 state["state2_row"] = self.get_state_buffer(p, dtype=torch.float32, factor="row")
                 state["state2_col"] = self.get_state_buffer(p, dtype=torch.float32, factor="col")
             else:
-                import pdb
-
-                pdb.set_trace()
                 if state["step"] == 0:
                     if "udynamic" not in self.name2qmap:
                         self.fill_qmap()
@@ -385,6 +387,7 @@ class ReAdamW8bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=8,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         is_paged=False,
@@ -408,6 +411,8 @@ class ReAdamW8bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -428,6 +433,7 @@ class ReAdamW8bit(Optimizer2State):
             weight_decay,
             8,  # Hardcoded to 8 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=is_paged,
@@ -444,6 +450,7 @@ class ReAdamW4bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         is_paged=False,
@@ -467,6 +474,8 @@ class ReAdamW4bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -487,6 +496,7 @@ class ReAdamW4bit(Optimizer2State):
             weight_decay,
             4,  # Hardcoded to 4 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=is_paged,
@@ -503,6 +513,7 @@ class ReAdamW2bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=2,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         is_paged=False,
@@ -526,6 +537,8 @@ class ReAdamW2bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -546,6 +559,7 @@ class ReAdamW2bit(Optimizer2State):
             weight_decay,
             2,  # Hardcoded to 2 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=is_paged,
@@ -562,6 +576,7 @@ class PagedReAdamW(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
     ):
@@ -583,6 +598,8 @@ class PagedReAdamW(Optimizer2State):
                 The number of bits of the optimizer state. Should be one of [2, 4, 8].
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -596,7 +613,8 @@ class PagedReAdamW(Optimizer2State):
             eps,
             weight_decay,
             optim_bits,
-            min_quant_size,
+            decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=True,
@@ -613,6 +631,7 @@ class PagedReAdamW8bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=8,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
     ):
@@ -635,6 +654,8 @@ class PagedReAdamW8bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -653,6 +674,7 @@ class PagedReAdamW8bit(Optimizer2State):
             weight_decay,
             8,  # Hardcoded to 8 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=True,
@@ -669,6 +691,7 @@ class PagedReAdamW4bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
     ):
@@ -691,6 +714,8 @@ class PagedReAdamW4bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -709,6 +734,7 @@ class PagedReAdamW4bit(Optimizer2State):
             weight_decay,
             4,  # Hardcoded to 4 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=True,
@@ -725,6 +751,7 @@ class PagedReAdamW2bit(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=2,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
     ):
@@ -747,6 +774,8 @@ class PagedReAdamW2bit(Optimizer2State):
                 Note: This parameter is not used in ReAdamW8bit as it always uses 8-bit quantization.
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -765,6 +794,7 @@ class PagedReAdamW2bit(Optimizer2State):
             weight_decay,
             2,  # Hardcoded to 2 bits
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=True,
