@@ -1231,6 +1231,10 @@ def optimizer_update_readam_1D(
     skip_zeros=False,
 ) -> None:
     is_on_gpu([p, g, state1, state2, qmap2, absmax2])
+    if g.numel() >= 2**31:
+        raise ValueError(
+            f"ReAdam kernels use 32-bit indexing and support at most 2**31 - 1 elements per tensor, got {g.numel()}"
+        )
 
     torch.ops.bitsandbytes.optimizer_update_readam_1D(
         g,
@@ -1278,6 +1282,10 @@ def optimizer_update_readam(
     thread-blocks, and needs extra memory. Overall, separating felt a more logical choice which keeps the code simple and clean, and has minimal overhead.
     """
     is_on_gpu([p, g, state1, state2_row, state2_col])
+    if g.numel() >= 2**31:
+        raise ValueError(
+            f"ReAdam kernels use 32-bit indexing and support at most 2**31 - 1 elements per tensor, got {g.numel()}"
+        )
 
     torch.ops.bitsandbytes.optimizer_update_readam(
         g,

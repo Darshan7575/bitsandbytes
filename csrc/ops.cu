@@ -219,8 +219,9 @@ void optimizerStaticReadam(
     float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
     bool skip_zeros, int n, int n_rows, int n_cols
 ) {
-    int total_bytes = (n * OPTIMIZER_BITS + 7) / 8; // handle bit packing for 2 and 4 bits
-    int num_blocks = (total_bytes + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
+    // 64-bit: n * OPTIMIZER_BITS overflows int32 for n > 2^31 / OPTIMIZER_BITS (e.g. 268M elements at 8 bits).
+    const int64_t total_bytes = ((int64_t)n * OPTIMIZER_BITS + 7) / 8; // handle bit packing for 2 and 4 bits
+    const int num_blocks = (int)((total_bytes + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM);
     int stride_full = n_rows * n_cols;
 
     kOptimizerStaticReadam<T, OPTIMIZER_BITS, NUM_THREADS_READAM><<<num_blocks, NUM_THREADS_READAM>>>(
