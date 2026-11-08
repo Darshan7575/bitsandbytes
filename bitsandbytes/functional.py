@@ -1310,8 +1310,16 @@ def optimizer_update_readam(
 
     # updating adafactor's statistics. (borrowed from: https://github.com/pytorch/pytorch/blob/v2.14.0/torch/optim/_adafactor.py)
     one_minus_beta2 = 1 - beta2
-    state2_row.lerp_(torch.linalg.vector_norm(g, dim=-1, keepdim=True).square_().div_(g.size(-1)), one_minus_beta2)
-    state2_col.lerp_(torch.linalg.vector_norm(g, dim=-2, keepdim=True).square_().div_(g.size(-2)), one_minus_beta2)
+    # Accumulate in fp32: in fp16 the squared row norm overflows for norms > 256, and lerp_ into the fp32 state buffers
+    # needs a fp32 operand.
+    state2_row.lerp_(
+        torch.linalg.vector_norm(g, dim=-1, keepdim=True, dtype=torch.float32).square_().div_(g.size(-1)),
+        one_minus_beta2,
+    )
+    state2_col.lerp_(
+        torch.linalg.vector_norm(g, dim=-2, keepdim=True, dtype=torch.float32).square_().div_(g.size(-2)),
+        one_minus_beta2,
+    )
 
     # import pdb; pdb.set_trace()
 
