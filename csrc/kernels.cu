@@ -1615,8 +1615,14 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
         int state2_col_base_idx = (batch_idx * n_cols);
         int state2_col_idx = (thread_base_idx % n_cols);
 
-        float row_val = __ldg(&state2_row[state2_row_idx]);
-        float mean_val = __ldg(&state2_mean[batch_idx]);
+        // Threads past the end of the tensor (last block) must not read the factored statistics: their row/batch
+        // indices point beyond state2_row/state2_mean.
+        float row_val = 0.0f;
+        float mean_val = 0.0f;
+        if (thread_base_idx < n) {
+            row_val = __ldg(&state2_row[state2_row_idx]);
+            mean_val = __ldg(&state2_mean[batch_idx]);
+        }
 
         unsigned int i_packed = i / N_PER_TH;
         // loads: 0.23 -> 0.85/1.44
@@ -1642,12 +1648,15 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
                     batch_idx = state2_row_idx / n_rows;
                     state2_col_base_idx = (batch_idx * n_cols);
 
-                    row_val = __ldg(&state2_row[state2_row_idx]);
-                    mean_val = __ldg(&state2_mean[batch_idx]);
+                    if (thread_base_idx + (int)j < n) {
+                        row_val = __ldg(&state2_row[state2_row_idx]);
+                        mean_val = __ldg(&state2_mean[batch_idx]);
+                    }
                 }
             }
 
-            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+            // padding elements (beyond n) are never stored, so they are treated like invalid gradients here
+            if (thread_base_idx + (int)j < n && !isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
                 s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
 
                 if (step == 1) {
