@@ -7,6 +7,8 @@
 #include <kernels.cuh>
 #include <limits>
 #include <ops.cuh>
+#include <stdexcept>
+#include <string>
 
 #define ERR_NOT_IMPLEMENTED 100
 
@@ -231,30 +233,66 @@ void optimizerStaticReadam(
     BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
 }
 
-#define READAM_FUSED_TILE_R 16
+template <typename T, int OPTIMIZER_BITS, int TILE_ROWS>
+static void launchReadamFused(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float* acc_row,
+    float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,
+    int batch, int n_rows, int n_cols, int tile_rows, int k_tiles
+) {
+    constexpr int TILE_COLS = (NUM_THREADS_READAM / TILE_ROWS) * (8 / OPTIMIZER_BITS);
+    const int rows_per_group = TILE_ROWS * k_tiles;
+    const int num_groups = batch * ((n_rows + rows_per_group - 1) / rows_per_group);
+    // the kernel loops over (batch slice, row group) with a grid stride, so gridDim.y can be capped at the hardware
+    // limit
+    dim3 grid((n_cols + TILE_COLS - 1) / TILE_COLS, num_groups < 65535 ? num_groups : 65535);
+    kOptimizerStaticReadamFused<T, OPTIMIZER_BITS, TILE_ROWS><<<grid, NUM_THREADS_READAM>>>(
+        p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr, weight_decay,
+        decay_ratio, batch, n_rows, n_cols, k_tiles
+    );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
 
 // Fused 2D ReAdam step: parameter/U_t update plus the factored second-moment statistics (see
-// kOptimizerStaticReadamFused). Requires n_cols % (8 / OPTIMIZER_BITS) == 0. acc_row (batch * n_rows) and acc_col
-// (batch * n_cols) must be zero on entry; they are zero again on return.
+// kOptimizerStaticReadamFused). Requires n_cols % (8 / OPTIMIZER_BITS) == 0. The tile is tile_rows x
+// (256 / tile_rows) * (8 / OPTIMIZER_BITS) elements (tile_rows in {4, 8, 16, 32}) and every block processes k_tiles
+// tiles down the rows. acc_row (batch * n_rows) and acc_col (batch * n_cols) must be zero on entry; they are zero again
+// on return.
 template <typename T, int OPTIMIZER_BITS>
 void optimizerStaticReadamFused(
     T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float* acc_row,
     float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,
-    int batch, int n_rows, int n_cols
+    int batch, int n_rows, int n_cols, int tile_rows, int k_tiles
 ) {
-    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
-    constexpr int TILE_C = NUM_THREADS_READAM * N_PER_TH;
-    const int total_rows = batch * n_rows;
-    const int row_tiles = (total_rows + READAM_FUSED_TILE_R - 1) / READAM_FUSED_TILE_R;
-
-    // the kernel loops over row tiles with a grid stride, so gridDim.y can be capped at the hardware limit
-    dim3 grid((n_cols + TILE_C - 1) / TILE_C, row_tiles < 65535 ? row_tiles : 65535);
-    kOptimizerStaticReadamFused<T, OPTIMIZER_BITS, NUM_THREADS_READAM, READAM_FUSED_TILE_R>
-        <<<grid, NUM_THREADS_READAM>>>(
+    if (k_tiles < 1)
+        k_tiles = 1;
+    switch (tile_rows) {
+    case 4:
+        launchReadamFused<T, OPTIMIZER_BITS, 4>(
             p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,
-            weight_decay, decay_ratio, total_rows, n_rows, n_cols
+            weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles
         );
-    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        break;
+    case 8:
+        launchReadamFused<T, OPTIMIZER_BITS, 8>(
+            p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,
+            weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles
+        );
+        break;
+    case 16:
+        launchReadamFused<T, OPTIMIZER_BITS, 16>(
+            p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,
+            weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles
+        );
+        break;
+    case 32:
+        launchReadamFused<T, OPTIMIZER_BITS, 32>(
+            p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,
+            weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles
+        );
+        break;
+    default:
+        throw std::runtime_error("tile_rows must be 4, 8, 16, or 32, got " + std::to_string(tile_rows));
+    }
 
     // one block per batch slice for rows + mean, plus up to 1024 grid-stride blocks for the columns
     int col_blocks = (batch * n_cols + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
@@ -713,7 +751,7 @@ MAKE_optimizerStaticReadam(bnb_bfloat16, 8);
     template void optimizerStaticReadamFused<gtype, optim_bits>(                                                       \
         gtype * p, gtype * g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,         \
         float* acc_row, float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay,   \
-        float decay_ratio, int batch, int n_rows, int n_cols                                                           \
+        float decay_ratio, int batch, int n_rows, int n_cols, int tile_rows, int k_tiles                               \
     );
 
 MAKE_optimizerStaticReadamFused(half, 2);

@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 from collections.abc import Iterable
 import ctypes as ct
+import functools
 import itertools
 from math import prod
 from typing import Any, Optional
@@ -1260,21 +1261,74 @@ def optimizer_update_readam_1D(
 
 # Set to False to always use the unfused 2D ReAdam path (update kernel + PyTorch statistics), e.g. for benchmarking.
 READAM_FUSED = True
-# The fused 2D kernel assigns 256 threads x (8 / optim_bits) columns per block; very narrow matrices would leave most
-# threads idle, so they use the unfused path.
-READAM_FUSED_MIN_COLS = 64
+# Force a tile shape / tiles-per-block for the fused kernel (None = automatic, see `readam_fused_config`).
+READAM_FUSED_TILE_ROWS: Optional[int] = None
+READAM_FUSED_K_TILES: Optional[int] = None
+
+# Tile heights of the fused kernel. A tile is tile_rows x (256 // tile_rows) * (8 // optim_bits) elements; each thread
+# owns one packed state1 byte. The relative cost reflects how well the state1 bytes of a tile row fill 32-byte sectors
+# (64 / 32 / 16 / 8 bytes per tile row), and is used to break ties between shapes that waste a similar number of threads.
+_READAM_TILE_COST = {8: 1.00, 4: 1.01, 16: 1.06, 32: 1.15}
+# Each block walks k_tiles tiles down the rows; aim for about this many rows per block (fewer column atomics).
+_READAM_ROWS_PER_BLOCK = 64
+# Shapes where even the best tile keeps fewer threads busy than this (e.g. 3x3 conv kernels) use the unfused path.
+_READAM_MIN_THREAD_UTIL = 0.25
+
+
+def _readam_tile_util(n_rows: int, n_cols: int, tile_rows: int, n_per_th: int) -> float:
+    """Fraction of the threads of a tiling that map to real elements."""
+    tile_cols = (256 // tile_rows) * n_per_th
+    return (n_rows * n_cols) / ((-(-n_rows // tile_rows) * tile_rows) * (-(-n_cols // tile_cols) * tile_cols))
 
 
 def readam_fused_supported(g: Tensor, optim_bits: int) -> bool:
     """Whether the fused 2D ReAdam kernel can handle a gradient of this shape/device."""
-    return (
+    if not (
         READAM_FUSED
         and g.device.type == "cuda"
         and g.dim() >= 2
         and g.is_contiguous()
-        and g.size(-1) >= READAM_FUSED_MIN_COLS
         and g.size(-1) % (8 // optim_bits) == 0
-    )
+    ):
+        return False
+    n_rows, n_cols, n_per_th = g.size(-2), g.size(-1), 8 // optim_bits
+    return max(_readam_tile_util(n_rows, n_cols, tr, n_per_th) for tr in _READAM_TILE_COST) >= _READAM_MIN_THREAD_UTIL
+
+
+def readam_fused_config(
+    batch: int, n_rows: int, n_cols: int, optim_bits: int, device: torch.device
+) -> tuple[int, int]:
+    """
+    Choose (tile_rows, k_tiles) for the fused 2D kernel.
+
+    tile_rows minimizes the padded (idle-thread) area of the tiling, weighted by `_READAM_TILE_COST`. k_tiles gives each
+    block about `_READAM_ROWS_PER_BLOCK` rows, and is halved while that would leave fewer than two blocks per SM.
+    """
+    n_per_th = 8 // optim_bits
+    if READAM_FUSED_TILE_ROWS is not None:
+        tile_rows = READAM_FUSED_TILE_ROWS
+    else:
+        # least idle threads, weighted by the sector efficiency of each shape; ties go to the first (8 rows)
+        tile_rows = min(
+            _READAM_TILE_COST, key=lambda tr: _READAM_TILE_COST[tr] / _readam_tile_util(n_rows, n_cols, tr, n_per_th)
+        )
+
+    if READAM_FUSED_K_TILES is not None:
+        return tile_rows, READAM_FUSED_K_TILES
+
+    tile_cols = (256 // tile_rows) * n_per_th
+    col_tiles = -(-n_cols // tile_cols)
+    row_tiles = -(-n_rows // tile_rows)
+    k_tiles = max(1, min(_READAM_ROWS_PER_BLOCK // tile_rows, row_tiles))
+    min_blocks = 2 * _multi_processor_count(device)
+    while k_tiles > 1 and col_tiles * batch * -(-row_tiles // k_tiles) < min_blocks:
+        k_tiles //= 2
+    return tile_rows, k_tiles
+
+
+@functools.cache
+def _multi_processor_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def optimizer_update_readam(
@@ -1338,6 +1392,7 @@ def optimizer_update_readam(
             lr,
             weight_decay,
             decay_ratio,
+            *readam_fused_config(batch, n_rows, n_cols, optim_bits, g.device),
         )
         return
 

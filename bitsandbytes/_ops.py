@@ -614,7 +614,7 @@ def _(
 
 torch.library.define(
     "bitsandbytes::optimizer_update_readam_fused",
-    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2_row, Tensor(a4!) state2_col, Tensor(a5!) state2_mean, Tensor(a6!) acc_row, Tensor(a7!) acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio) -> ()",
+    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2_row, Tensor(a4!) state2_col, Tensor(a5!) state2_mean, Tensor(a6!) acc_row, Tensor(a7!) acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, int tile_rows, int k_tiles) -> ()",
 )
 
 
@@ -636,7 +636,11 @@ def _(
     lr: float,
     weight_decay: float,
     decay_ratio: float,
+    tile_rows: int,
+    k_tiles: int,
 ) -> None:
+    torch._check(tile_rows in (4, 8, 16, 32), lambda: f"tile_rows must be 4, 8, 16, or 32, got {tile_rows}")
+    torch._check(k_tiles >= 1, lambda: f"k_tiles must be >= 1, got {k_tiles}")
     torch._check(g.dim() >= 2, lambda: f"g must have at least 2 dimensions, got {g.dim()}")
     torch._check(
         g.shape == p.shape,

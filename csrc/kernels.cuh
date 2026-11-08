@@ -80,13 +80,13 @@ __global__ void kOptimizerStaticReadam(
     const bool skip_zeros, const int n, const int n_rows, const int n_cols, const int stride_full
 );
 
-template <typename T, int OPTIMIZER_BITS, int NUM_THREADS, int TILE_R>
+template <typename T, int OPTIMIZER_BITS, int TILE_ROWS>
 __global__ void kOptimizerStaticReadamFused(
     T* __restrict__ const p, T* __restrict__ const g, unsigned char* __restrict__ const state1,
     float* __restrict__ const state2_row, float* __restrict__ const state2_col, float* __restrict__ const state2_mean,
     float* __restrict__ const acc_row, float* __restrict__ const acc_col, const float beta1, const float beta2,
-    const float eps, const int step, const float lr, const float weight_decay, const float decay_ratio,
-    const int total_rows, const int n_rows, const int n_cols
+    const float eps, const int step, const float lr, const float weight_decay, const float decay_ratio, const int batch,
+    const int n_rows, const int n_cols, const int k_tiles
 );
 
 template <int NUM_THREADS>

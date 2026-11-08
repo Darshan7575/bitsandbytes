@@ -21,9 +21,9 @@ def _new_state(shape, optim_bits, device):
     }
 
 
-def _step(p, g, st, optim_bits, step, weight_decay, fused, scratch):
-    prev = F.READAM_FUSED
-    F.READAM_FUSED = fused
+def _step(p, g, st, optim_bits, step, weight_decay, fused, scratch, tile_rows=None, k_tiles=None):
+    prev = (F.READAM_FUSED, F.READAM_FUSED_TILE_ROWS, F.READAM_FUSED_K_TILES)
+    F.READAM_FUSED, F.READAM_FUSED_TILE_ROWS, F.READAM_FUSED_K_TILES = fused, tile_rows, k_tiles
     try:
         F.optimizer_update_readam(
             g,
@@ -43,16 +43,22 @@ def _step(p, g, st, optim_bits, step, weight_decay, fused, scratch):
             stats_scratch=scratch,
         )
     finally:
-        F.READAM_FUSED = prev
+        F.READAM_FUSED, F.READAM_FUSED_TILE_ROWS, F.READAM_FUSED_K_TILES = prev
 
 
-# (512, 768): full tiles; (4, 33, 256): batch slices whose rows do not align with the 16-row tiles;
-# (1000, 520): partial column tile.
-@pytest.mark.parametrize("shape", [(512, 768), (4, 33, 256), (1000, 520)], ids=str)
+# (512, 768): full tiles; (4, 33, 256): batch slices whose rows do not align with the tiles; (1000, 520): partial
+# column tile; (300, 16): narrow (LoRA B-like); (4, 4096): few rows (LoRA A-like).
+SHAPES = [(512, 768), (4, 33, 256), (1000, 520), (300, 16), (4, 4096)]
+
+
+# tile/k: (None, None) = automatic choice; otherwise force a tile height (and k_tiles=3 to exercise a partial last
+# row group inside a block).
+@pytest.mark.parametrize("tile", [(None, None), (4, None), (8, None), (16, None), (32, 3)], ids=str)
+@pytest.mark.parametrize("shape", SHAPES, ids=str)
 @pytest.mark.parametrize("optim_bits", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16], ids=str)
 @pytest.mark.parametrize("weight_decay", [0.0, 0.01])
-def test_readam_fused_matches_unfused(shape, optim_bits, dtype, weight_decay):
+def test_readam_fused_matches_unfused(tile, shape, optim_bits, dtype, weight_decay):
     """Each step starts both paths from identical state, so differences come only from the step itself."""
     device = "cuda"
     torch.manual_seed(0)
@@ -75,7 +81,7 @@ def test_readam_fused_matches_unfused(shape, optim_bits, dtype, weight_decay):
         p_fused = p_ref.clone()
         st_fused = {k: v.clone() for k, v in st_ref.items()}
 
-        _step(p_fused, g, st_fused, optim_bits, step, weight_decay, True, scratch)
+        _step(p_fused, g, st_fused, optim_bits, step, weight_decay, True, scratch, *tile)
         _step(p_ref, g, st_ref, optim_bits, step, weight_decay, False, None)
         torch.cuda.synchronize()
 

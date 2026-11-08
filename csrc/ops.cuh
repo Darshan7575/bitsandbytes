@@ -133,7 +133,7 @@ template <typename T, int OPTIMIZER_BITS>
 void optimizerStaticReadamFused(
     T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float* acc_row,
     float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,
-    int batch, int n_rows, int n_cols
+    int batch, int n_rows, int n_cols, int tile_rows, int k_tiles
 );
 
 void gemmex(

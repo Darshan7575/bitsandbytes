@@ -1341,6 +1341,8 @@ def _optimizer_update_readam_fused_impl(
     lr: float,
     weight_decay: float,
     decay_ratio: float,
+    tile_rows: int,
+    k_tiles: int,
 ) -> None:
     if g.dtype == torch.float32:
         optimizer_fn = lib.creadam_fused_grad_fp32
@@ -1377,6 +1379,8 @@ def _optimizer_update_readam_fused_impl(
             ct.c_int32(batch),
             ct.c_int32(n_rows),
             ct.c_int32(n_cols),
+            ct.c_int32(tile_rows),
+            ct.c_int32(k_tiles),
         )
 
 

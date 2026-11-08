@@ -220,25 +220,25 @@ MAKE_READAM(float, fp32)
     void readam_fused_grad_##gbits(                                                                                    \
         gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
         float* acc_row, float* acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr,       \
-        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols                                       \
+        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols, int tile_rows, int k_tiles           \
     ) {                                                                                                                \
         switch (optim_bits) {                                                                                          \
         case 2:                                                                                                        \
             optimizerStaticReadamFused<gtype, 2>(                                                                      \
                 p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
-                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+                weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles                                   \
             );                                                                                                         \
             break;                                                                                                     \
         case 4:                                                                                                        \
             optimizerStaticReadamFused<gtype, 4>(                                                                      \
                 p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
-                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+                weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles                                   \
             );                                                                                                         \
             break;                                                                                                     \
         case 8:                                                                                                        \
             optimizerStaticReadamFused<gtype, 8>(                                                                      \
                 p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
-                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+                weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles                                   \
             );                                                                                                         \
             break;                                                                                                     \
         default:                                                                                                       \
@@ -665,11 +665,11 @@ MAKE_CREADAM(bnb_bfloat16, bf16)
     void creadam_fused_grad_##gbits(                                                                                   \
         gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
         float* acc_row, float* acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr,       \
-        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols                                       \
+        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols, int tile_rows, int k_tiles           \
     ) {                                                                                                                \
         readam_fused_grad_##gbits(                                                                                     \
             p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, optim_bits, beta1, beta2, eps, step,  \
-            lr, weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+            lr, weight_decay, decay_ratio, batch, n_rows, n_cols, tile_rows, k_tiles                                   \
         );                                                                                                             \
     }
 

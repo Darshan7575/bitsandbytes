@@ -1729,87 +1729,86 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
 //   accumulates
 //                                  the row and column sums of G_t^2 into the scratch buffers acc_row / acc_col.
 //   kReadamFinalizeStats         : r_t = beta2 * r_{t-1} + (1 - beta2) * acc_row / n_cols (same for c_t with n_rows),
-//                                  mean_t = mean(r_t) per batch, and re-zeroes acc_row / acc_col for the next call.
+//                                  mean_t = mean(r_t) per batch slice, and re-zeroes acc_row / acc_col.
 //
 // The new sums go to separate accumulators so that every block of the first kernel reads consistent t-1 statistics.
 //
-// Layout: the tensor is viewed as total_rows = batch * n_rows rows of n_cols elements. A block owns a tile of TILE_R
-// rows x TILE_C = NUM_THREADS * N_PER_TH columns; every thread owns N_PER_TH consecutive columns, i.e. exactly one
-// packed byte of state1 per row (requires n_cols % N_PER_TH == 0, which keeps rows byte-aligned in the flat packed
-// state1 layout used by the unfused kernel). Column partial sums stay in registers across the rows of the tile, so
-// acc_col receives one atomic per column per tile and acc_row one atomic per row per tile.
+// Layout: the tensor is viewed as `batch` slices of n_rows x n_cols. A block of 256 threads covers a tile of
+// TILE_ROWS x TILE_COLS elements, TILE_COLS = (256 / TILE_ROWS) * N_PER_TH: thread t owns tile row t / THREADS_PER_ROW
+// and N_PER_TH consecutive columns, i.e. exactly one packed byte of state1 (requires n_cols % N_PER_TH == 0, which
+// keeps rows byte-aligned in the flat packed state1 layout). Each block processes `k_tiles` tiles stacked down the rows
+// of one batch slice, so the thread's columns stay the same and the column partial sums stay in registers:
+//   - row sums: logical-warp reduction over the threads of a tile row -> one atomic per row per tile (two for
+//     TILE_ROWS = 4 on 32-wide warps, whose 64-thread rows span two warps),
+//   - column sums: registers across the k_tiles tiles, a shared-memory reduction over the tile rows at the end ->
+//     one atomic per column per block.
+// TILE_ROWS = 4 / 8 give full 32-byte sectors for the state1 bytes of a tile row, 16 / 32 suit narrow matrices.
 //
 // Non-finite gradients are skipped (treated as 0) in the statistics so a single NaN/Inf cannot poison r and c.
 // Float atomics make the statistics non-deterministic in the last bits from run to run.
 // ---------------------------------------------------------------------------------------------------------------------
-template <typename T, int OPTIMIZER_BITS, int NUM_THREADS, int TILE_R>
-__launch_bounds__(NUM_THREADS, 3) __global__ void kOptimizerStaticReadamFused(
+template <typename T, int OPTIMIZER_BITS, int TILE_ROWS>
+__launch_bounds__(256, 3) __global__ void kOptimizerStaticReadamFused(
     T* __restrict__ const p, T* __restrict__ const g, unsigned char* __restrict__ const state1,
     float* __restrict__ const state2_row, float* __restrict__ const state2_col, float* __restrict__ const state2_mean,
     float* __restrict__ const acc_row, float* __restrict__ const acc_col, const float beta1, const float beta2,
-    const float eps, const int step, const float lr, const float weight_decay, const float decay_ratio,
-    const int total_rows, const int n_rows, const int n_cols
+    const float eps, const int step, const float lr, const float weight_decay, const float decay_ratio, const int batch,
+    const int n_rows, const int n_cols, const int k_tiles
 ) {
+    constexpr int NUM_THREADS = 256;
     constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
-    constexpr int TILE_C = NUM_THREADS * N_PER_TH;
-    constexpr int NUM_WARPS = NUM_THREADS / BNB_WARP_SIZE;
-    static_assert(NUM_THREADS % BNB_WARP_SIZE == 0, "NUM_THREADS must be a multiple of the warp size");
-    static_assert(TILE_R <= NUM_THREADS, "one thread per tile row flushes the row sums");
+    constexpr int THREADS_PER_ROW = NUM_THREADS / TILE_ROWS;
+    constexpr int TILE_COLS = THREADS_PER_ROW * N_PER_TH;
+    constexpr int LOGICAL_WARP = THREADS_PER_ROW < BNB_WARP_SIZE ? THREADS_PER_ROW : BNB_WARP_SIZE;
+    static_assert(NUM_THREADS % TILE_ROWS == 0, "TILE_ROWS must divide the block size");
 
-    typedef bnb_cub::WarpReduce<float> WarpReduce;
-    __shared__ typename WarpReduce::TempStorage warp_storage[NUM_WARPS];
-    __shared__ float smem_row[TILE_R];
+    typedef bnb_cub::WarpReduce<float, LOGICAL_WARP> RowReduce;
+    __shared__ typename RowReduce::TempStorage row_storage[NUM_THREADS / LOGICAL_WARP];
+    __shared__ float smem_col[TILE_COLS];
 
     const float at = __fdividef(1.0f - beta1, 1.0f - __powf(beta1, step));
     const float beta2_tprev = 1.0f - __powf(beta2, step - 1);
     const float bt = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step));
     const float eps_sq = eps * eps;
 
-    const int warp_id = threadIdx.x / BNB_WARP_SIZE;
-    const int lane_id = threadIdx.x % BNB_WARP_SIZE;
-    const int col0 = blockIdx.x * TILE_C + threadIdx.x * N_PER_TH;
+    const int local_row = threadIdx.x / THREADS_PER_ROW;
+    const int local_col = (threadIdx.x % THREADS_PER_ROW) * N_PER_TH;
+    const int col0 = blockIdx.x * TILE_COLS + local_col;
     // n_cols % N_PER_TH == 0, so either all N_PER_TH columns of this thread exist or none does.
-    const bool active = col0 < n_cols;
-    const int num_row_tiles = (total_rows + TILE_R - 1) / TILE_R;
+    const bool col_valid = col0 < n_cols;
+
+    const int rows_per_group = TILE_ROWS * k_tiles;
+    const int groups_per_slice = (n_rows + rows_per_group - 1) / rows_per_group;
+    const int num_groups = batch * groups_per_slice;
 
     float col_prev[N_PER_TH];
     float col_acc[N_PER_TH];
     float s1_vals[N_PER_TH];
     bool s1_in_decay[N_PER_TH];
 
-    for (int tile = blockIdx.y; tile < num_row_tiles; tile += gridDim.y) {
-        const int row_begin = tile * TILE_R;
-        const int row_end = min(row_begin + TILE_R, total_rows);
+    // grid-stride over (batch slice, row group); a block never mixes batch slices, so its column sums belong to one
+    // slice of acc_col.
+    for (int group = blockIdx.y; group < num_groups; group += gridDim.y) {
+        const int b = group / groups_per_slice;
+        const int group_row0 = (group % groups_per_slice) * rows_per_group;
+        const float mean_prev = state2_mean[b];
 
-        if (threadIdx.x < TILE_R)
-            smem_row[threadIdx.x] = 0.0f;
-        __syncthreads();
-
-        int batch = -1;
-        float mean_prev = 0.0f;
-
-        for (int row = row_begin; row < row_end; ++row) {
-            const int b = row / n_rows;
-            if (b != batch) {
-                // entering a new batch slice (always on the first row; mid-tile only when n_rows % TILE_R != 0)
-                if (batch >= 0 && active) {
+        for (int i = threadIdx.x; i < TILE_COLS; i += NUM_THREADS)
+            smem_col[i] = 0.0f;
 #pragma unroll
-                    for (int j = 0; j < N_PER_TH; j++)
-                        atomicAdd(&acc_col[batch * n_cols + col0 + j], col_acc[j]);
-                }
-                batch = b;
-                mean_prev = state2_mean[b];
-#pragma unroll
-                for (int j = 0; j < N_PER_TH; j++) {
-                    col_acc[j] = 0.0f;
-                    col_prev[j] = active ? state2_col[b * n_cols + col0 + j] : 0.0f;
-                }
-            }
+        for (int j = 0; j < N_PER_TH; j++) {
+            col_acc[j] = 0.0f;
+            col_prev[j] = col_valid ? state2_col[b * n_cols + col0 + j] : 0.0f;
+        }
 
+        for (int k = 0; k < k_tiles; k++) {
+            const int row = group_row0 + k * TILE_ROWS + local_row; // row within the batch slice
             float row_part = 0.0f;
-            if (active) {
-                const float row_prev = state2_row[row];
-                const int64_t base = (int64_t)row * n_cols + col0;
+
+            if (col_valid && row < n_rows) {
+                const int slice_row = b * n_rows + row;
+                const float row_prev = state2_row[slice_row];
+                const int64_t base = (int64_t)slice_row * n_cols + col0;
                 const unsigned char packed = state1[base / N_PER_TH];
 
 #pragma unroll
@@ -1851,23 +1850,28 @@ __launch_bounds__(NUM_THREADS, 3) __global__ void kOptimizerStaticReadamFused(
                 state1[base / N_PER_TH] = quantize_update<OPTIMIZER_BITS>(s1_vals, s1_in_decay, eps);
             }
 
-            // Row sum over the tile: warp reduction, then one shared-memory atomic per warp.
-            row_part = WarpReduce(warp_storage[warp_id]).Sum(row_part);
-            if (lane_id == 0 && row_part != 0.0f)
-                atomicAdd(&smem_row[row - row_begin], row_part);
+            // Row sum over the threads of this tile row (all threads take part; invalid ones contribute 0).
+            row_part = RowReduce(row_storage[threadIdx.x / LOGICAL_WARP]).Sum(row_part);
+            if (threadIdx.x % LOGICAL_WARP == 0 && row < n_rows && row_part != 0.0f)
+                atomicAdd(&acc_row[b * n_rows + row], row_part);
             __syncwarp();
         }
 
-        if (batch >= 0 && active) {
+        // Column sums: combine the TILE_ROWS threads that share a column, then one atomic per column.
+        __syncthreads(); // smem_col zeroed by all threads before anyone adds
+        if (col_valid) {
 #pragma unroll
             for (int j = 0; j < N_PER_TH; j++)
-                atomicAdd(&acc_col[batch * n_cols + col0 + j], col_acc[j]);
+                if (col_acc[j] != 0.0f)
+                    atomicAdd(&smem_col[local_col + j], col_acc[j]);
         }
-
         __syncthreads();
-        if (threadIdx.x < row_end - row_begin)
-            atomicAdd(&acc_row[row_begin + threadIdx.x], smem_row[threadIdx.x]);
-        __syncthreads(); // smem_row is reset at the start of the next tile
+        for (int i = threadIdx.x; i < TILE_COLS; i += NUM_THREADS) {
+            const int col = blockIdx.x * TILE_COLS + i;
+            if (col < n_cols && smem_col[i] != 0.0f)
+                atomicAdd(&acc_col[b * n_cols + col], smem_col[i]);
+        }
+        __syncthreads(); // smem_col is reset by the next group
     }
 }
 
@@ -2472,22 +2476,55 @@ MAKE_OptimizerStaticReadam1D(float, 2, 256) MAKE_OptimizerStaticReadam1D(float, 
         half, 4, 256
     ) MAKE_OptimizerStaticReadam(half, 8, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 2, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 4, 256) MAKE_OptimizerStaticReadam(bnb_bfloat16, 8, 256)
 
-#define MAKE_OptimizerStaticReadamFused(gtype, optim_bits, num_threads, tile_r)                                        \
-    template __global__ void kOptimizerStaticReadamFused<gtype, optim_bits, num_threads, tile_r>(                      \
+#define MAKE_OptimizerStaticReadamFused(gtype, optim_bits, tile_rows)                                                  \
+    template __global__ void kOptimizerStaticReadamFused<gtype, optim_bits, tile_rows>(                                \
         gtype* __restrict__ const p, gtype* __restrict__ const g, unsigned char* __restrict__ const state1,            \
         float* __restrict__ const state2_row, float* __restrict__ const state2_col,                                    \
         float* __restrict__ const state2_mean, float* __restrict__ const acc_row, float* __restrict__ const acc_col,   \
         const float beta1, const float beta2, const float eps, const int step, const float lr,                         \
-        const float weight_decay, const float decay_ratio, const int total_rows, const int n_rows, const int n_cols    \
+        const float weight_decay, const float decay_ratio, const int batch, const int n_rows, const int n_cols,        \
+        const int k_tiles                                                                                              \
     );
 
-        MAKE_OptimizerStaticReadamFused(float, 2, 256, 16) MAKE_OptimizerStaticReadamFused(float, 4, 256, 16) MAKE_OptimizerStaticReadamFused(float, 8, 256, 16) MAKE_OptimizerStaticReadamFused(half, 2, 256, 16) MAKE_OptimizerStaticReadamFused(half, 4, 256, 16) MAKE_OptimizerStaticReadamFused(
-            half, 8, 256, 16
-        ) MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 2, 256, 16) MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 4, 256, 16) MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 8, 256, 16)
+        MAKE_OptimizerStaticReadamFused(float, 2, 4);
+MAKE_OptimizerStaticReadamFused(float, 2, 8);
+MAKE_OptimizerStaticReadamFused(float, 2, 16);
+MAKE_OptimizerStaticReadamFused(float, 2, 32);
+MAKE_OptimizerStaticReadamFused(float, 4, 4);
+MAKE_OptimizerStaticReadamFused(float, 4, 8);
+MAKE_OptimizerStaticReadamFused(float, 4, 16);
+MAKE_OptimizerStaticReadamFused(float, 4, 32);
+MAKE_OptimizerStaticReadamFused(float, 8, 4);
+MAKE_OptimizerStaticReadamFused(float, 8, 8);
+MAKE_OptimizerStaticReadamFused(float, 8, 16);
+MAKE_OptimizerStaticReadamFused(float, 8, 32);
+MAKE_OptimizerStaticReadamFused(half, 2, 4);
+MAKE_OptimizerStaticReadamFused(half, 2, 8);
+MAKE_OptimizerStaticReadamFused(half, 2, 16);
+MAKE_OptimizerStaticReadamFused(half, 2, 32);
+MAKE_OptimizerStaticReadamFused(half, 4, 4);
+MAKE_OptimizerStaticReadamFused(half, 4, 8);
+MAKE_OptimizerStaticReadamFused(half, 4, 16);
+MAKE_OptimizerStaticReadamFused(half, 4, 32);
+MAKE_OptimizerStaticReadamFused(half, 8, 4);
+MAKE_OptimizerStaticReadamFused(half, 8, 8);
+MAKE_OptimizerStaticReadamFused(half, 8, 16);
+MAKE_OptimizerStaticReadamFused(half, 8, 32);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 2, 4);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 2, 8);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 2, 16);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 2, 32);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 4, 4);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 4, 8);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 4, 16);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 4, 32);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 8, 4);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 8, 8);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 8, 16);
+MAKE_OptimizerStaticReadamFused(bnb_bfloat16, 8, 32);
 
-            template __global__
-    void kReadamFinalizeStats<256>(
-        float* __restrict__ const state2_row, float* __restrict__ const state2_col,
-        float* __restrict__ const state2_mean, float* __restrict__ const acc_row, float* __restrict__ const acc_col,
-        const float beta2, const int batch, const int n_rows, const int n_cols
-    );
+template __global__ void kReadamFinalizeStats<256>(
+    float* __restrict__ const state2_row, float* __restrict__ const state2_col, float* __restrict__ const state2_mean,
+    float* __restrict__ const acc_row, float* __restrict__ const acc_col, const float beta2, const int batch,
+    const int n_rows, const int n_cols
+);
