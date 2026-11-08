@@ -254,6 +254,8 @@ class Optimizer2State(OptimizerQuantized):
         state["step"] += 1
         step = state["step"]
 
+        # import pdb; pdb.set_trace()
+
         if state["state1"].dtype == torch.float:
             # as the size of parameter is smaller than `min_quant_size`, we use full-precision adam here.
             F.optimizer_update_32bit(

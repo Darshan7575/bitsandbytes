@@ -1251,6 +1251,8 @@ def optimizer_update_readam_1D(
         skip_zeros,
     )
 
+    # import pdb; pdb.set_trace()
+
 
 def optimizer_update_readam(
     g: Tensor,
@@ -1296,10 +1298,14 @@ def optimizer_update_readam(
         skip_zeros,
     )
 
+    # import pdb; pdb.set_trace()
+
     # updating adafactor's statistics. (borrowed from: https://github.com/pytorch/pytorch/blob/v2.14.0/torch/optim/_adafactor.py)
-    one_minus_beta2 = step**beta2
+    one_minus_beta2 = 1 - beta2
     state2_row.lerp_(torch.linalg.vector_norm(g, dim=-1, keepdim=True).square_().div_(g.size(-1)), one_minus_beta2)
     state2_col.lerp_(torch.linalg.vector_norm(g, dim=-2, keepdim=True).square_().div_(g.size(-2)), one_minus_beta2)
+
+    # import pdb; pdb.set_trace()
 
 
 @deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)

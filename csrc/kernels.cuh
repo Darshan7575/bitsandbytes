@@ -74,10 +74,10 @@ __global__ void kOptimizerStaticReadam1D(
 
 template <typename T, int OPTIMIZER_BITS, int NUM_THREADS>
 __global__ void kOptimizerStaticReadam(
-    T* p, T* __restrict__ const g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,
-    const float beta1, const float beta2, const float eps, const int step, const float lr, float weight_decay,
-    float decay_ratio, const float gnorm_scale, const bool skip_zeros, const int n, const int n_rows, const int n_cols,
-    const int stride_full
+    T* p, T* __restrict__ const g, unsigned char* state1, float* __restrict__ const state2_row,
+    float* __restrict__ const state2_col, float* __restrict__ const state2_mean, const float beta1, const float beta2,
+    const float eps, const int step, const float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
+    const bool skip_zeros, const int n, const int n_rows, const int n_cols, const int stride_full
 );
 
 template <int ITEMS_PER_THREAD, int THREADS>

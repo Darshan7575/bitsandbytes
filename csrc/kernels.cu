@@ -1593,7 +1593,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
     bool s1_in_decay[N_PER_TH];
 
     const float at = __fdividef(1.0f - beta1, 1.0f - __powf(beta1, step));
-    const float bt_prev = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step - 1));
+    const float beta2_tprev = 1.0f - __powf(beta2, step - 1);
     const float bt = __fdividef(1.0f - beta2, 1.0f - __powf(beta2, step));
     const float eps_sq = eps * eps;
 
@@ -1663,19 +1663,30 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
             if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
                 s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
 
-                // Here, we use the equations from algorithm 2 of the original Adafactor paper to reconstruct state2. We
-                // do not use any advanced update clipping mechanisms that the original paper proposes in section 6.
-                s2_val = __fdividef(
-                    row_val * __ldg(&state2_col[state2_col_base_idx + state2_col_idx]), mean_val + eps_sq
-                ); // pytorch adafactor implementation uses eps1 instead of eps^2, which is passed as additional
-                   // argument.
-                s2_val = sqrtf(__fdividef(s2_val, bt_prev));
+                if (step == 1) {
+                    s1_vals[j] = copysignf(1.0f, g_vals[j]);
+                } else {
+                    // Here, we use the equations from algorithm 2 of the original Adafactor paper to reconstruct
+                    // state2. We do not use any advanced update clipping mechanisms that the original paper proposes in
+                    // section 6.
+                    s2_val = __fdividef(
+                        row_val * __ldg(&state2_col[state2_col_base_idx + state2_col_idx]), mean_val + eps_sq
+                    ); // pytorch adafactor implementation uses eps1 instead of eps^2, which is passed as additional
+                    // argument.
+                    s2_val = sqrtf(__fdividef(s2_val, beta2_tprev));
 
-                z_val = __fdividef(g_vals[j], s2_val + eps);
+                    z_val = __fdividef(g_vals[j], s2_val + eps);
 
-                s1_vals[j] =
-                    __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps);
-                s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+                    s1_vals[j] = __fdividef(
+                        ((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
+                    );
+                    s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+                }
+
+                // if(threadIdx.x == 0){
+                //     printf("after update: %f, %f, %f, %f, %f \n", s1_vals[j], (float)g_vals[j], at, bt, beta2_tprev);
+                // }
+
             } else {
                 s1_vals[j] = 0.0f;
                 s1_in_decay[j] = false;
