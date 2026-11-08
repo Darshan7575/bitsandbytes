@@ -1651,7 +1651,10 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
                 s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
 
                 if (step == 1) {
-                    s1_vals[j] = copysignf(1.0f, g_vals[j]);
+                    // U_1 = sign(G_1), with sign(0) = 0 so that coordinates without gradient do not move
+                    // (matches Adam, where M_1 = 0 for those coordinates).
+                    const float g_f = (float)g_vals[j];
+                    s1_vals[j] = (float)((g_f > 0.0f) - (g_f < 0.0f));
                     s1_in_decay[j] = false;
                 } else {
                     // Here, we use the equations from algorithm 2 of the original Adafactor paper to reconstruct
