@@ -203,7 +203,8 @@ void optimizerStaticReadam1D(
     // state2. For example, if OPTIMIZER_BITS=2, then each thread will handle 1 entry of state1 which will have values
     // corresponding to 4 parameter entries (bit packed) and 4 values from state2 since state2 is 8 bit quantized.
     constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
-    int num_blocks = (n + N_PER_TH - 1) / (N_PER_TH * NUM_THREADS_READAM); // handle bit packing for 2 and 4 bits
+    constexpr int BLOCK_SIZE = N_PER_TH * NUM_THREADS_READAM; // elements handled by one block per iteration
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     kOptimizerStaticReadam1D<T, OPTIMIZER_BITS, NUM_THREADS_READAM><<<num_blocks, NUM_THREADS_READAM>>>(
         p, g, state1, state2, beta1, beta2, eps, step, lr, quantiles2, absmax2, weight_decay, decay_ratio, gnorm_scale,
