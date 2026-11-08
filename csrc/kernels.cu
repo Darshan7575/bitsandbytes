@@ -1652,6 +1652,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
 
                 if (step == 1) {
                     s1_vals[j] = copysignf(1.0f, g_vals[j]);
+                    s1_in_decay[j] = false;
                 } else {
                     // Here, we use the equations from algorithm 2 of the original Adafactor paper to reconstruct
                     // state2. We do not use any advanced update clipping mechanisms that the original paper proposes in
