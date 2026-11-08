@@ -330,6 +330,7 @@ class ReAdamW(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         is_paged=False,
@@ -355,6 +356,8 @@ class ReAdamW(Optimizer2State):
                 The number of bits of the optimizer state. Should be one of [2, 4, 8].
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -371,6 +374,7 @@ class ReAdamW(Optimizer2State):
             weight_decay,
             optim_bits,
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=is_paged,
