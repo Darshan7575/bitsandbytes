@@ -1323,15 +1323,28 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStatic8bit1StateBlockwise(
     }
 }
 
+// ReAdam quantization map for U_t (paper eq. 6). With b bits, 1 bit holds the sign and the remaining b-1 bits index
+// 2N magnitudes, N = 2^(b-2):
+//   ids [0, N-1]   : N levels log-spaced from eps to 0.1 (inclusive)      eps * (0.1/eps)^(k/(N-1))
+//   ids [N, 2N-1]  : N levels linearly spaced above 0.1 up to 1.0        0.1 + 0.9 * m / N,  m = 1..N
+// For b = 2 (N = 1) the map degenerates to {eps, 1.0}.
+template <int OPTIMIZER_BITS> __device__ __forceinline__ float readam_level(int mag_id, const float eps) {
+    constexpr int N = 1 << (OPTIMIZER_BITS - 2);
+    if (mag_id < N) {
+        if constexpr (N == 1)
+            return eps;
+        else
+            return expf(logf(eps) + ((float)mag_id / (N - 1)) * (logf(0.1f) - logf(eps)));
+    }
+    return 0.1f + 0.9f * (float)(mag_id - N + 1) / N;
+}
+
 // `vals` is the array of signed values containing `8/OPTIMIZER_BITS` entries which are packed into 1 byte.
 template <int OPTIMIZER_BITS>
-__device__ __forceinline__ float quantize_update(const float* vals, const bool* in_decay, const float eps) {
+__device__ __forceinline__ unsigned char quantize_update(const float* vals, const bool* in_decay, const float eps) {
 
-    constexpr int NUM_MAG_BITS = OPTIMIZER_BITS - 1;
-    constexpr int TOTAL_MAG_VALS = 1 << NUM_MAG_BITS;
-    constexpr int HALF_MAG_VALS = TOTAL_MAG_VALS >> 1;
-    constexpr int NUM_LOG_VALS = HALF_MAG_VALS + 1;
-    constexpr int NUM_LIN_VALS = TOTAL_MAG_VALS - NUM_LOG_VALS;
+    constexpr int N = 1 << (OPTIMIZER_BITS - 2); // magnitude levels per region
+    constexpr int SIGN_BIT = 1 << (OPTIMIZER_BITS - 1);
 
     unsigned char packed_byte = 0;
 
@@ -1340,38 +1353,30 @@ __device__ __forceinline__ float quantize_update(const float* vals, const bool* 
         float val = vals[j];
 
         bool is_negative = val < 0.0f;
-        float mag = fabsf(val);
-
         // Clamp magnitude to [eps, 1.0f]
-        mag = fminf(fmaxf(mag, eps), 1.0f);
+        float mag = fminf(fmaxf(fabsf(val), eps), 1.0f);
 
-        unsigned int mag_id = 0;
-
-        if (mag <= 0.1f) {
-            // Inverse of log scale: logf(eps) to logf(0.1f)
+        int mag_id;
+        if constexpr (N == 1) {
+            // 2-bit: levels {eps, 1.0}, pick the nearest one.
+            mag_id = mag > 0.5f ? 1 : 0;
+        } else if (mag <= 0.1f) {
+            // Log region: round in log space to one of the N levels in [eps, 0.1].
             float t = (logf(mag) - logf(eps)) / (logf(0.1f) - logf(eps));
-            // Map t to discrete index in [0, NUM_LOG_VALS - 1]
-            mag_id = (unsigned int)roundf(t * (NUM_LOG_VALS - 1));
-            mag_id = min(mag_id, (unsigned int)(NUM_LOG_VALS - 1));
+            mag_id = min((int)roundf(t * (N - 1)), N - 1);
         } else {
-            // Inverse of linear scale: above 0.1f to 1.0f
-            float t = (mag - 0.1f) / 0.9f;
-            // Map t to discrete index in [NUM_LOG_VALS, TOTAL_MAG_VALS - 1]
-            unsigned int lin_id = (unsigned int)roundf(t * NUM_LIN_VALS);
-            lin_id = min(lin_id, (unsigned int)(NUM_LIN_VALS - 1));
-            mag_id = NUM_LOG_VALS + lin_id;
+            // Linear region: m = 0 corresponds to 0.1 (the top log level, id N-1), m = 1..N to ids N..2N-1.
+            int m = (int)roundf((mag - 0.1f) * (N / 0.9f));
+            mag_id = N - 1 + min(m, N);
         }
 
-        // incase the coordinate is in the decay regime, move one step closer towards zero.
+        // incase the coordinate is in the decay regime, move one step closer towards zero (paper eq. 7).
         mag_id = (in_decay[j] && mag_id > 0) ? mag_id - 1 : mag_id;
 
-        // 3. Set sign bit in MSB of the b-bit value
         unsigned char val_ind = (unsigned char)mag_id;
-        if (is_negative) {
-            val_ind |= TOTAL_MAG_VALS;
-        }
+        if (is_negative)
+            val_ind |= SIGN_BIT;
 
-        // 4. Pack into the byte using bitwise shift
         packed_byte |= (val_ind << (j * OPTIMIZER_BITS));
     }
 
@@ -1383,31 +1388,13 @@ template <int OPTIMIZER_BITS>
 __device__ __forceinline__ float dequantize_update(unsigned char packed_x, int ind, const float eps) {
 
     constexpr unsigned char PACKED_MASK = (1 << OPTIMIZER_BITS) - 1;
-    constexpr int NUM_MAG_BITS = OPTIMIZER_BITS - 1;
-    constexpr int TOTAL_MAG_VALS = 1 << NUM_MAG_BITS;
-    constexpr int HALF_MAG_VALS = TOTAL_MAG_VALS >> 1;
-    constexpr unsigned char MAG_MASK = TOTAL_MAG_VALS - 1;
+    constexpr int SIGN_BIT = 1 << (OPTIMIZER_BITS - 1);
 
-    constexpr int NUM_LOG_VALS = HALF_MAG_VALS + 1;
-    constexpr int NUM_LIN_VALS = TOTAL_MAG_VALS - NUM_LOG_VALS;
-
-    float mag = 0.0f;
     unsigned char val_ind = (packed_x >> (ind * OPTIMIZER_BITS)) & PACKED_MASK;
+    float mag = readam_level<OPTIMIZER_BITS>(val_ind & (SIGN_BIT - 1), eps);
 
-    unsigned int mag_id = val_ind & MAG_MASK;
-    if (mag_id < NUM_LOG_VALS) {
-        // First half (Log scale): equally spaced from eps to 0.1, including 0.1
-        float t = (NUM_LOG_VALS <= 1) ? 0.0f : (float)mag_id / (NUM_LOG_VALS - 1);
-        mag = expf(logf(eps) + t * (logf(0.1f) - logf(eps)));
-    } else {
-        // Second half (Linear scale): equally spaced from above 0.1 to 1.0 (excluding 0.1)
-        unsigned int lin_id = mag_id - NUM_LOG_VALS;
-        float t = (NUM_LIN_VALS <= 1) ? 0.0f : (float)(lin_id + 1) / (NUM_LIN_VALS + 1);
-        mag = 0.1f + t * (1.0f - 0.1f);
-    }
-
-    // 4. Apply Sign (MSB holds sign)
-    mag = (val_ind & TOTAL_MAG_VALS) ? -mag : mag;
+    // Apply sign (MSB holds sign)
+    mag = (val_ind & SIGN_BIT) ? -mag : mag;
 
     return mag;
 }
