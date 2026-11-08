@@ -38,11 +38,23 @@ class OptimizerQuantized(BaseOptimizer8bit):
             "state2",  # fallback buffer for storing full S_t for 1D params where adafactor factorization is not possible
             "state2_row",  # buffer for row sum of adafactor compressed second moment
             "state2_col",  # buffer for column sum of adafactor compressed second moment
+            "state2_mean",  # mean of state2_row per 2D slice (kept up to date by the fused kernel)
             "absmax2",
             "unorm_vec",  # update norm scales
         }
 
         self.fill_qmap()
+
+        # zero-filled float32 scratch per device for the fused 2D kernel's row/column accumulators. Shared by all
+        # parameters: the kernels run in order on one stream and the finalize kernel re-zeroes it after each use.
+        self._stats_scratch = {}
+
+    def get_stats_scratch(self, device, numel):
+        buf = self._stats_scratch.get(device)
+        if buf is None or buf.numel() < numel:
+            buf = torch.zeros(numel, dtype=torch.float32, device=device)
+            self._stats_scratch[device] = buf
+        return buf
 
     def fill_qmap(self):
         self.name2qmap["udynamic"] = F.create_dynamic_map(signed=False)
@@ -219,6 +231,7 @@ class Optimizer2State(OptimizerQuantized):
                 # TODO (darshan): In theory, these row/column stats can be quantized, but the memory gain is very marginal with additional compute overhead, and is not worth the effort.
                 state["state2_row"] = self.get_state_buffer(p, dtype=torch.float32, factor="row")
                 state["state2_col"] = self.get_state_buffer(p, dtype=torch.float32, factor="col")
+                state["state2_mean"] = torch.zeros_like(state["state2_row"].mean(dim=-2))
             else:
                 if state["step"] == 0:
                     if "udynamic" not in self.name2qmap:
@@ -301,6 +314,11 @@ class Optimizer2State(OptimizerQuantized):
                     skip_zeros=config["skip_zeros"],
                 )
             elif "state2_row" in state:
+                if "state2_mean" not in state:
+                    # state loaded from a checkpoint written before state2_mean existed
+                    state["state2_mean"] = state["state2_row"].mean(dim=-2)
+                n_rows, n_cols = grad.size(-2), grad.size(-1)
+                batch = grad.numel() // (n_rows * n_cols)
                 F.optimizer_update_readam(
                     grad,
                     p,
@@ -317,6 +335,8 @@ class Optimizer2State(OptimizerQuantized):
                     config["decay_ratio"],
                     gnorm_scale=1.0,
                     skip_zeros=config["skip_zeros"],
+                    state2_mean=state["state2_mean"],
+                    stats_scratch=self.get_stats_scratch(grad.device, batch * (n_rows + n_cols)),
                 )
 
 

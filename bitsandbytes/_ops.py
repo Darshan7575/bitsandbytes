@@ -610,3 +610,63 @@ def _(
         state2_row.dtype == state2_col.dtype == state2_mean.dtype == torch.float32,
         lambda: f"Expected state2_row, state2_col and state2_mean to be float32, got state2_row.dtype={state2_row.dtype}, state2_col.dtype={state2_col.dtype}, state2_mean.dtype={state2_mean.dtype}",
     )
+
+
+torch.library.define(
+    "bitsandbytes::optimizer_update_readam_fused",
+    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2_row, Tensor(a4!) state2_col, Tensor(a5!) state2_mean, Tensor(a6!) acc_row, Tensor(a7!) acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio) -> ()",
+)
+
+
+@register_fake("bitsandbytes::optimizer_update_readam_fused")
+def _(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    acc_row: torch.Tensor,
+    acc_col: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+) -> None:
+    torch._check(g.dim() >= 2, lambda: f"g must have at least 2 dimensions, got {g.dim()}")
+    torch._check(
+        g.shape == p.shape,
+        lambda: f"g and p must have the same shape, got {tuple(g.shape)} and {tuple(p.shape)}",
+    )
+    torch._check(
+        g.dtype in (torch.float16, torch.bfloat16, torch.float32),
+        lambda: f"g must be bfloat16, float16, or float32, got {g.dtype}",
+    )
+    torch._check(
+        g.dtype == p.dtype,
+        lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    )
+    torch._check(state1.dtype == torch.uint8, lambda: f"state1 must be uint8, got {state1.dtype}")
+    torch._check(optim_bits in (2, 4, 8), lambda: f"optim_bits must be 2, 4, or 8, got {optim_bits}")
+    torch._check(
+        g.size(-1) % (8 // optim_bits) == 0,
+        lambda: f"the last dimension ({g.size(-1)}) must be divisible by {8 // optim_bits} for {optim_bits}-bit states",
+    )
+    n_rows, n_cols = g.size(-2), g.size(-1)
+    batch = g.numel() // max(n_rows * n_cols, 1)
+    for name, t, numel in (
+        ("state2_row", state2_row, batch * n_rows),
+        ("state2_col", state2_col, batch * n_cols),
+        ("state2_mean", state2_mean, batch),
+        ("acc_row", acc_row, batch * n_rows),
+        ("acc_col", acc_col, batch * n_cols),
+    ):
+        torch._check(t.dtype == torch.float32, lambda name=name, t=t: f"{name} must be float32, got {t.dtype}")
+        torch._check(
+            t.numel() == numel,
+            lambda name=name, t=t, numel=numel: f"{name} must have {numel} elements, got {t.numel()}",
+        )

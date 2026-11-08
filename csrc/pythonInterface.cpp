@@ -216,6 +216,40 @@ MAKE_READAM(half, fp16)
 MAKE_READAM(bnb_bfloat16, bf16)
 MAKE_READAM(float, fp32)
 
+#define MAKE_READAM_FUSED(gtype, gbits)                                                                                \
+    void readam_fused_grad_##gbits(                                                                                    \
+        gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
+        float* acc_row, float* acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr,       \
+        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols                                       \
+    ) {                                                                                                                \
+        switch (optim_bits) {                                                                                          \
+        case 2:                                                                                                        \
+            optimizerStaticReadamFused<gtype, 2>(                                                                      \
+                p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
+                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 4:                                                                                                        \
+            optimizerStaticReadamFused<gtype, 4>(                                                                      \
+                p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
+                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+            );                                                                                                         \
+            break;                                                                                                     \
+        case 8:                                                                                                        \
+            optimizerStaticReadamFused<gtype, 8>(                                                                      \
+                p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,      \
+                weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+            );                                                                                                         \
+            break;                                                                                                     \
+        default:                                                                                                       \
+            throw std::runtime_error("optim_bits must be 2, 4, or 8, got " + std::to_string(optim_bits));              \
+        }                                                                                                              \
+    }
+
+MAKE_READAM_FUSED(half, fp16)
+MAKE_READAM_FUSED(bnb_bfloat16, bf16)
+MAKE_READAM_FUSED(float, fp32)
+
 void quantizeBlockwise_fp16(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
     quantizeBlockwise<half, 0, General8bit>(code, A, absmax, out, nullptr, 0, blocksize, n);
 }
@@ -626,6 +660,22 @@ MAKE_CREADAM_1D(bnb_bfloat16, bf16)
 MAKE_CREADAM(half, fp16)
 MAKE_CREADAM(float, fp32)
 MAKE_CREADAM(bnb_bfloat16, bf16)
+
+#define MAKE_CREADAM_FUSED(gtype, gbits)                                                                               \
+    void creadam_fused_grad_##gbits(                                                                                   \
+        gtype* p, gtype* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,           \
+        float* acc_row, float* acc_col, int optim_bits, float beta1, float beta2, float eps, int step, float lr,       \
+        float weight_decay, float decay_ratio, int batch, int n_rows, int n_cols                                       \
+    ) {                                                                                                                \
+        readam_fused_grad_##gbits(                                                                                     \
+            p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, optim_bits, beta1, beta2, eps, step,  \
+            lr, weight_decay, decay_ratio, batch, n_rows, n_cols                                                       \
+        );                                                                                                             \
+    }
+
+MAKE_CREADAM_FUSED(half, fp16)
+MAKE_CREADAM_FUSED(float, fp32)
+MAKE_CREADAM_FUSED(bnb_bfloat16, bf16)
 
 void cigemm(
     Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,

@@ -231,6 +231,40 @@ void optimizerStaticReadam(
     BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
 }
 
+#define READAM_FUSED_TILE_R 16
+
+// Fused 2D ReAdam step: parameter/U_t update plus the factored second-moment statistics (see
+// kOptimizerStaticReadamFused). Requires n_cols % (8 / OPTIMIZER_BITS) == 0. acc_row (batch * n_rows) and acc_col
+// (batch * n_cols) must be zero on entry; they are zero again on return.
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadamFused(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float* acc_row,
+    float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,
+    int batch, int n_rows, int n_cols
+) {
+    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
+    constexpr int TILE_C = NUM_THREADS_READAM * N_PER_TH;
+    const int total_rows = batch * n_rows;
+    const int row_tiles = (total_rows + READAM_FUSED_TILE_R - 1) / READAM_FUSED_TILE_R;
+
+    // the kernel loops over row tiles with a grid stride, so gridDim.y can be capped at the hardware limit
+    dim3 grid((n_cols + TILE_C - 1) / TILE_C, row_tiles < 65535 ? row_tiles : 65535);
+    kOptimizerStaticReadamFused<T, OPTIMIZER_BITS, NUM_THREADS_READAM, READAM_FUSED_TILE_R>
+        <<<grid, NUM_THREADS_READAM>>>(
+            p, g, state1, state2_row, state2_col, state2_mean, acc_row, acc_col, beta1, beta2, eps, step, lr,
+            weight_decay, decay_ratio, total_rows, n_rows, n_cols
+        );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+
+    // one block per batch slice for rows + mean, plus up to 1024 grid-stride blocks for the columns
+    int col_blocks = (batch * n_cols + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
+    col_blocks = col_blocks < 1 ? 1 : (col_blocks > 1024 ? 1024 : col_blocks);
+    kReadamFinalizeStats<NUM_THREADS_READAM><<<batch + col_blocks, NUM_THREADS_READAM>>>(
+        state2_row, state2_col, state2_mean, acc_row, acc_col, beta2, batch, n_rows, n_cols
+    );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
 void gemmex(
     Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
     int ldb, int ldc
@@ -674,3 +708,20 @@ MAKE_optimizerStaticReadam(float, 8);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 2);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 4);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 8);
+
+#define MAKE_optimizerStaticReadamFused(gtype, optim_bits)                                                             \
+    template void optimizerStaticReadamFused<gtype, optim_bits>(                                                       \
+        gtype * p, gtype * g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,         \
+        float* acc_row, float* acc_col, float beta1, float beta2, float eps, int step, float lr, float weight_decay,   \
+        float decay_ratio, int batch, int n_rows, int n_cols                                                           \
+    );
+
+MAKE_optimizerStaticReadamFused(half, 2);
+MAKE_optimizerStaticReadamFused(half, 4);
+MAKE_optimizerStaticReadamFused(half, 8);
+MAKE_optimizerStaticReadamFused(float, 2);
+MAKE_optimizerStaticReadamFused(float, 4);
+MAKE_optimizerStaticReadamFused(float, 8);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 2);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 4);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 8);

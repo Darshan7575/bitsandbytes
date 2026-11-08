@@ -1324,7 +1324,64 @@ def _optimizer_update_readam_impl(
         )
 
 
+def _optimizer_update_readam_fused_impl(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    acc_row: torch.Tensor,
+    acc_col: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+) -> None:
+    if g.dtype == torch.float32:
+        optimizer_fn = lib.creadam_fused_grad_fp32
+    elif g.dtype == torch.float16:
+        optimizer_fn = lib.creadam_fused_grad_fp16
+    elif g.dtype == torch.bfloat16:
+        optimizer_fn = lib.creadam_fused_grad_bf16
+    else:
+        raise ValueError(
+            f"Unsupported gradient dtype: {g.dtype}. Supported dtypes: torch.float32, torch.float16, torch.bfloat16"
+        )
+
+    n_rows, n_cols = g.size(-2), g.size(-1)
+    batch = g.numel() // (n_rows * n_cols)
+
+    with _cuda_device_of(g):
+        optimizer_fn(
+            get_ptr(p),
+            get_ptr(g),
+            get_ptr(state1),
+            get_ptr(state2_row),
+            get_ptr(state2_col),
+            get_ptr(state2_mean),
+            get_ptr(acc_row),
+            get_ptr(acc_col),
+            ct.c_int32(optim_bits),
+            ct.c_float(beta1),
+            ct.c_float(beta2),
+            ct.c_float(eps),
+            ct.c_int32(step),
+            ct.c_float(lr),
+            ct.c_float(weight_decay),
+            ct.c_float(decay_ratio),
+            ct.c_int32(batch),
+            ct.c_int32(n_rows),
+            ct.c_int32(n_cols),
+        )
+
+
 register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "cuda")(_optimizer_update_8bit_blockwise_impl)
 register_kernel("bitsandbytes::optimizer_update_readam_1D", "cuda")(_optimizer_update_readam_1D_impl)
 register_kernel("bitsandbytes::optimizer_update_readam", "cuda")(_optimizer_update_readam_impl)
+register_kernel("bitsandbytes::optimizer_update_readam_fused", "cuda")(_optimizer_update_readam_fused_impl)
 register_kernel("bitsandbytes::optimizer_update_32bit", "cuda")(_optimizer_update_32bit_impl)

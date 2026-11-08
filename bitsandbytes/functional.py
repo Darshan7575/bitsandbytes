@@ -1258,6 +1258,25 @@ def optimizer_update_readam_1D(
     # import pdb; pdb.set_trace()
 
 
+# Set to False to always use the unfused 2D ReAdam path (update kernel + PyTorch statistics), e.g. for benchmarking.
+READAM_FUSED = True
+# The fused 2D kernel assigns 256 threads x (8 / optim_bits) columns per block; very narrow matrices would leave most
+# threads idle, so they use the unfused path.
+READAM_FUSED_MIN_COLS = 64
+
+
+def readam_fused_supported(g: Tensor, optim_bits: int) -> bool:
+    """Whether the fused 2D ReAdam kernel can handle a gradient of this shape/device."""
+    return (
+        READAM_FUSED
+        and g.device.type == "cuda"
+        and g.dim() >= 2
+        and g.is_contiguous()
+        and g.size(-1) >= READAM_FUSED_MIN_COLS
+        and g.size(-1) % (8 // optim_bits) == 0
+    )
+
+
 def optimizer_update_readam(
     g: Tensor,
     p: Tensor,
@@ -1274,9 +1293,19 @@ def optimizer_update_readam(
     decay_ratio: float = 10.0,
     gnorm_scale: float = 1.0,
     skip_zeros=False,
+    state2_mean: Optional[Tensor] = None,
+    stats_scratch: Optional[Tensor] = None,
 ) -> None:
     """
-    NOTE: Here, we deliberately chose to split ReAdam's operations into (1) a custom kernel that updates weight and U (state1), and (2) a native torch
+    2D ReAdam step with the Adafactor-factored scale.
+
+    If `state2_mean` (the persistent per-slice mean of `state2_row`) and `stats_scratch` (a zero-filled float32 buffer
+    with at least `batch * (n_rows + n_cols)` elements, left zero-filled on return) are given and the shape qualifies
+    (see `readam_fused_supported`), a fused kernel updates the parameters, U_t and the row/column statistics while
+    reading the gradient only once. Otherwise the update kernel is followed by a PyTorch implementation of the
+    statistics update.
+
+    NOTE (unfused path): Here, we deliberately chose to split ReAdam's operations into (1) a custom kernel that updates weight and U (state1), and (2) a native torch
     implementation that updates adafactor's statistics. We do this because designing a thread launch configuration that can cater to all weight shapes
     such as lean matrices, and perform the reduction over both row and column causes thread under-utilization, requires collaborative writes across
     thread-blocks, and needs extra memory. Overall, separating felt a more logical choice which keeps the code simple and clean, and has minimal overhead.
@@ -1286,6 +1315,31 @@ def optimizer_update_readam(
         raise ValueError(
             f"ReAdam kernels use 32-bit indexing and support at most 2**31 - 1 elements per tensor, got {g.numel()}"
         )
+
+    if state2_mean is not None and stats_scratch is not None and readam_fused_supported(g, optim_bits):
+        n_rows, n_cols = g.size(-2), g.size(-1)
+        batch = g.numel() // (n_rows * n_cols)
+        acc_row = stats_scratch[: batch * n_rows]
+        acc_col = stats_scratch[batch * n_rows : batch * (n_rows + n_cols)]
+        torch.ops.bitsandbytes.optimizer_update_readam_fused(
+            g,
+            p,
+            state1,
+            state2_row,
+            state2_col,
+            state2_mean,
+            acc_row,
+            acc_col,
+            optim_bits,
+            beta1,
+            beta2,
+            eps,
+            step,
+            lr,
+            weight_decay,
+            decay_ratio,
+        )
+        return
 
     torch.ops.bitsandbytes.optimizer_update_readam(
         g,
@@ -1320,6 +1374,9 @@ def optimizer_update_readam(
         torch.linalg.vector_norm(g, dim=-2, keepdim=True, dtype=torch.float32).square_().div_(g.size(-2)),
         one_minus_beta2,
     )
+    if state2_mean is not None:
+        # keep the persistent mean in sync so that switching between the fused and unfused paths stays consistent
+        state2_mean.copy_(state2_row.mean(dim=-2))
 
     # import pdb; pdb.set_trace()
 
