@@ -1505,7 +1505,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam1D(
                 s1_vals[j] = __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), denom + eps);
                 s2_vals[j] = (s2_vals[j] == 0.0f) ? (sqrtf(bt) * fabsf(g_vals[j])) : s2_vals[j] * denom;
 
-                s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+                s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
 
             } else {
                 s1_vals[j] = 0.0f;
@@ -1667,7 +1667,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
                     s1_vals[j] = __fdividef(
                         ((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
                     );
-                    s1_in_decay[j] = (fabsf(s1_vals[j]) >= (z_val * decay_ratio));
+                    s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
                 }
 
                 // if(threadIdx.x == 0){
