@@ -207,7 +207,7 @@ class Optimizer2State(OptimizerQuantized):
         state["step"] = 0
 
         if p.numel() >= config["min_quant_size"]:
-            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8, optim_bits=self.args.optim_bits)
+            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8, optim_bits=config["optim_bits"])
 
             if p.dim() > 1:
                 # do adafactor compression only if the param is not 1D and has size greater than the minimum size required for quantization
