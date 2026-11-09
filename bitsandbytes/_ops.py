@@ -610,3 +610,68 @@ def _(
         state2_row.dtype == state2_col.dtype == state2_mean.dtype == torch.float32,
         lambda: f"Expected state2_row, state2_col and state2_mean to be float32, got state2_row.dtype={state2_row.dtype}, state2_col.dtype={state2_col.dtype}, state2_mean.dtype={state2_mean.dtype}",
     )
+
+
+torch.library.define(
+    "bitsandbytes::optimizer_update_readam_fused",
+    "(Tensor(a0!) g, Tensor(a1!) p, Tensor(a2!) state1, Tensor(a3!) state2_row, Tensor(a4!) state2_col, Tensor(a5!) state2_mean, Tensor(a6!) state2_accum_row, Tensor(a7!) state2_accum_col, int optim_bits, int[4] dims, float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, float gnorm_scale, bool skip_zeros=False) -> ()",
+)
+
+
+@register_fake("bitsandbytes::optimizer_update_readam_fused")
+def _(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    state2_accum_row: torch.Tensor,
+    state2_accum_col: torch.Tensor,
+    optim_bits: int,
+    dims: tuple[int, int, int, int],
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    torch._check(
+        g.numel() == p.numel(),
+        lambda: f"g and p must have the same number of elements, got {g.numel()} and {p.numel()}",
+    )
+    compute_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
+    torch._check(
+        g.dtype in compute_dtypes,
+        lambda: f"g must be bfloat16, float16, or float32, got {g.dtype}",
+    )
+    torch._check(
+        g.dtype == p.dtype,
+        lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    )
+    torch._check(
+        state1.dtype == torch.uint8,
+        lambda: f"state1 must be uint8, got {state1.dtype}",
+    )
+    torch._check(
+        state2_row.dtype
+        == state2_col.dtype
+        == state2_mean.dtype
+        == state2_accum_row.dtype
+        == state2_accum_col.dtype
+        == torch.float32,
+        lambda: f"Expected state2_row, state2_col, state2_mean, state2_accum_row and state2_accum_col to be float32, got state2_row.dtype={state2_row.dtype}, state2_col.dtype={state2_col.dtype}, state2_mean.dtype={state2_mean.dtype}, state2_accum_row.dtype={state2_accum_row.dtype}, state2_accum_col.dtype={state2_accum_col.dtype}",
+    )
+    torch._check(
+        state2_row.numel() == state2_accum_row.numel(),
+        lambda: f"Expected state2_row and state2_accum_row to have the same number of elements, got state2_row.numel()={state2_row.numel()}, state2_accum_row.numel()={state2_accum_row.numel()}",
+    )
+    torch._check(
+        state2_col.numel() == state2_accum_col.numel(),
+        lambda: f"Expected state2_col and state2_accum_col to have the same number of elements, got state2_col.numel()={state2_col.numel()}, state2_accum_col.numel()={state2_accum_col.numel()}",
+    )

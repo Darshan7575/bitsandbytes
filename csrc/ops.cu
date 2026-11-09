@@ -217,18 +217,122 @@ template <typename T, int OPTIMIZER_BITS>
 void optimizerStaticReadam(
     T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float beta1,
     float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
-    bool skip_zeros, int n, int n_rows, int n_cols
+    bool skip_zeros, int n, int n_rows_per_batch, int n_cols_per_batch
 ) {
     // 64-bit: n * OPTIMIZER_BITS overflows int32 for n > 2^31 / OPTIMIZER_BITS (e.g. 268M elements at 8 bits).
     const int64_t total_bytes = ((int64_t)n * OPTIMIZER_BITS + 7) / 8; // handle bit packing for 2 and 4 bits
     const int num_blocks = (int)((total_bytes + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM);
-    int stride_full = n_rows * n_cols;
+    const int stride_batch = n_rows_per_batch * n_cols_per_batch;
 
     kOptimizerStaticReadam<T, OPTIMIZER_BITS, NUM_THREADS_READAM><<<num_blocks, NUM_THREADS_READAM>>>(
         p, g, state1, state2_row, state2_col, state2_mean, beta1, beta2, eps, step, lr, weight_decay, decay_ratio,
-        gnorm_scale, skip_zeros, n, n_rows, n_cols, stride_full
+        gnorm_scale, skip_zeros, n, n_rows_per_batch, n_cols_per_batch, stride_batch
     );
     BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+// Variable names are deliberately kept as verbose as possible for readability.
+template <typename T, int OPTIMIZER_BITS, int N_ROWS_PER_TILE>
+static void launchReadamFused(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,
+    float* state2_accum_row, float* state2_accum_col, float beta1, float beta2, float eps, int step, float lr,
+    float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_batch,
+    int n_rows_per_batch, int n_cols_per_batch
+) {
+    // we want one thread block to process many vertical tiles, so that the atomic adds are fewer.
+
+    constexpr int N_COLS_PER_TILE = (NUM_THREADS_READAM / N_ROWS_PER_TILE);
+    constexpr int N_ELEMS_PER_TILE_ROW = N_COLS_PER_TILE * (8 / OPTIMIZER_BITS);
+
+    constexpr int K_TILES = 64 / N_ROWS_PER_TILE;
+    const int row_tiles = (n_rows_per_batch + N_ROWS_PER_TILE - 1) / N_ROWS_PER_TILE;
+    const int k_tiles = row_tiles < K_TILES ? row_tiles : K_TILES;
+
+    const int n_rows_per_tileblock = N_ROWS_PER_TILE * k_tiles;
+
+    // x: tile column dimension, y: row tile-group dimension (because multiple tiles are processed together), and z:
+    // batch dimension. Here, first dim has a LOT of indexing range (2**31-1), so no need to cap it.
+    const int n_tileblocks_per_batch = (n_rows_per_batch + n_rows_per_tileblock - 1) / n_rows_per_tileblock;
+    dim3 grid(
+        (n_cols_per_batch + N_ELEMS_PER_TILE_ROW - 1) / N_ELEMS_PER_TILE_ROW,
+        n_tileblocks_per_batch < 65535 ? n_tileblocks_per_batch : 65535, n_batch < 65535 ? n_batch : 65535
+    );
+
+    // since the thread configuration caps 2 of the dimensions, we precompute the strides for the batch since we need it
+    // later. That is, we consider the weight as a 3D array of tiles, then stride_z helps you go from any position
+    // within tile (b, i, j) to the same position within tile (b+1, i, j).
+    const int stride_batch = n_rows_per_batch * n_cols_per_batch;
+
+    // Since one thread block processes multiple tiles, stride_tile helps you move from any position within the current
+    // tile to the same position in the next vertical tile.
+    const int stride_tile_per_tileblock = N_ROWS_PER_TILE * n_cols_per_batch;
+
+    kOptimizerStaticReadamFused<T, OPTIMIZER_BITS, NUM_THREADS_READAM, N_ROWS_PER_TILE><<<grid, NUM_THREADS_READAM>>>(
+        p, g, state1, state2_row, state2_col, state2_mean, state2_accum_row, state2_accum_col, beta1, beta2, eps, step,
+        lr, weight_decay, decay_ratio, gnorm_scale, skip_zeros, n, n_batch, n_rows_per_batch, n_cols_per_batch,
+        n_tileblocks_per_batch, n_rows_per_tileblock, stride_batch, stride_tile_per_tileblock, k_tiles
+    );
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadamFused(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,
+    float* state2_accum_row, float* state2_accum_col, float beta1, float beta2, float eps, int step, float lr,
+    float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_batch,
+    int n_rows_per_batch, int n_cols_per_batch
+) {
+    /*
+    Summary: We look at the entire N-d weight tensor as a flattened 3D matrix of shape (batch, n_rows_per_batch,
+    n_cols_per_batch). Each thread block processes tiles of shape [`N_ROWS_PER_TILE`, `N_COLS_PER_TILE`] from this
+    3D-tensor, by performing the weight update, state1 update and computing the final row and column sum for the tile
+    using warp and block reduce operations. The end row/column sums for the tile is written to accumulators using atomic
+    add operations. To ensure we do not run too many atomic add operations which could become a bottleneck, each thread
+    block processes `K_TILES` vertical tiles (along column, if they exist). We call this a tile block. For the majority
+    of the matrices, we use [8, 32] thread configuration, where each thread processes N_PER_TH number of elements
+    (number of entries that gets packed in 1 byte). This allows for the most efficient warp loads. For other cases (for
+    example LoRA), we use [16, 16] or [32, 8] thread configuration which ensures majority of the threads are in
+    operation, while taking a small hit during warp loads.
+    */
+
+    constexpr int N_PER_TH = 8 / OPTIMIZER_BITS;
+
+    if (n_cols_per_batch >= 32 * N_PER_TH) {
+        launchReadamFused<T, OPTIMIZER_BITS, /*N_ROWS_PER_TILE=*/8>(
+            p, g, state1, state2_row, state2_col, state2_mean, state2_accum_row, state2_accum_col, beta1, beta2, eps,
+            step, lr, weight_decay, decay_ratio, gnorm_scale, skip_zeros, n, n_batch, n_rows_per_batch, n_cols_per_batch
+        );
+    } else if (n_cols_per_batch >= 16 * N_PER_TH) {
+        launchReadamFused<T, OPTIMIZER_BITS, /*N_ROWS_PER_TILE=*/16>(
+            p, g, state1, state2_row, state2_col, state2_mean, state2_accum_row, state2_accum_col, beta1, beta2, eps,
+            step, lr, weight_decay, decay_ratio, gnorm_scale, skip_zeros, n, n_batch, n_rows_per_batch, n_cols_per_batch
+        );
+    } else {
+        launchReadamFused<T, OPTIMIZER_BITS, /*N_ROWS_PER_TILE=*/32>(
+            p, g, state1, state2_row, state2_col, state2_mean, state2_accum_row, state2_accum_col, beta1, beta2, eps,
+            step, lr, weight_decay, decay_ratio, gnorm_scale, skip_zeros, n, n_batch, n_rows_per_batch, n_cols_per_batch
+        );
+    }
+
+    if (n_rows_per_batch < n_cols_per_batch) {
+        // one block per batch slice for rows + mean, plus up to 1024 grid-stride blocks for the columns
+        int n_blocks = ((n_batch * n_cols_per_batch) + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
+        n_blocks = n_blocks < 1 ? 1 : (n_blocks > 1024 ? 1024 : n_blocks);
+        kReadamFinalizeStats<NUM_THREADS_READAM><<<n_batch + n_blocks, NUM_THREADS_READAM>>>(
+            state2_row, state2_col, state2_mean, state2_accum_row, state2_accum_col, beta2, n_batch, n_rows_per_batch,
+            n_cols_per_batch
+        );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+    } else {
+        // one block per batch slice for cols + mean, plus up to 1024 grid-stride blocks for the rows
+        int n_blocks = ((n_batch * n_rows_per_batch) + NUM_THREADS_READAM - 1) / NUM_THREADS_READAM;
+        n_blocks = n_blocks < 1 ? 1 : (n_blocks > 1024 ? 1024 : n_blocks);
+        kReadamFinalizeStats<NUM_THREADS_READAM><<<n_batch + n_blocks, NUM_THREADS_READAM>>>(
+            state2_col, state2_row, state2_mean, state2_accum_col, state2_accum_row, beta2, n_batch, n_cols_per_batch,
+            n_rows_per_batch
+        );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+    }
 }
 
 void gemmex(
@@ -662,7 +766,7 @@ MAKE_optimizerStaticReadam1D(bnb_bfloat16, 8);
     template void optimizerStaticReadam<gtype, optim_bits>(                                                            \
         gtype * p, gtype * g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,         \
         float beta1, float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio,                \
-        const float gnorm_scale, bool skip_zeros, int n, int n_rows, int n_cols                                        \
+        const float gnorm_scale, bool skip_zeros, int n, int n_rows_per_batch, int n_cols_per_batch                    \
     );
 
 MAKE_optimizerStaticReadam(half, 2);
@@ -674,3 +778,21 @@ MAKE_optimizerStaticReadam(float, 8);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 2);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 4);
 MAKE_optimizerStaticReadam(bnb_bfloat16, 8);
+
+#define MAKE_optimizerStaticReadamFused(gtype, optim_bits)                                                             \
+    template void optimizerStaticReadamFused<gtype, optim_bits>(                                                       \
+        gtype * p, gtype * g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,         \
+        float* state2_accum_row, float* state2_accum_col, float beta1, float beta2, float eps, int step, float lr,     \
+        float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_batch,           \
+        int n_rows_per_batch, int n_cols_per_batch                                                                     \
+    );
+
+MAKE_optimizerStaticReadamFused(half, 2);
+MAKE_optimizerStaticReadamFused(half, 4);
+MAKE_optimizerStaticReadamFused(half, 8);
+MAKE_optimizerStaticReadamFused(float, 2);
+MAKE_optimizerStaticReadamFused(float, 4);
+MAKE_optimizerStaticReadamFused(float, 8);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 2);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 4);
+MAKE_optimizerStaticReadamFused(bnb_bfloat16, 8);

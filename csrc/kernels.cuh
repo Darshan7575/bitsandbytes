@@ -77,7 +77,25 @@ __global__ void kOptimizerStaticReadam(
     T* p, T* __restrict__ const g, unsigned char* state1, float* __restrict__ const state2_row,
     float* __restrict__ const state2_col, float* __restrict__ const state2_mean, const float beta1, const float beta2,
     const float eps, const int step, const float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
-    const bool skip_zeros, const int n, const int n_rows, const int n_cols, const int stride_full
+    const bool skip_zeros, const int n, const int n_rows, const int n_cols, const int stride_batch
+);
+
+template <typename T, int OPTIMIZER_BITS, int NUM_THREADS, int N_ROWS_PER_TILE>
+__global__ void kOptimizerStaticReadamFused(
+    T* p, T* __restrict__ const g, unsigned char* state1, float* __restrict__ const state2_row,
+    float* __restrict__ const state2_col, float* __restrict__ const state2_mean, float* state2_accum_row,
+    float* state2_accum_col, const float beta1, const float beta2, const float eps, const int step, const float lr,
+    float weight_decay, float decay_ratio, const float gnorm_scale, const bool skip_zeros, const int n,
+    const int n_batch, const int n_rows_per_batch, const int n_cols_per_batch, const int n_tileblocks_per_batch,
+    const int n_rows_per_tileblock, const int stride_batch, const int stride_tile_per_tileblock, const int k_tiles
+);
+
+template <int NUM_THREADS>
+__global__ void kReadamFinalizeStats(
+    float* __restrict__ const state2_stat1, float* __restrict__ const state2_stat2,
+    float* __restrict__ const state2_mean, float* __restrict__ const state2_accum_stat1,
+    float* __restrict__ const state2_accum_stat2, const float beta2, const int n_batch, const int n_stat1,
+    const int n_stat2
 );
 
 template <int ITEMS_PER_THREAD, int THREADS>

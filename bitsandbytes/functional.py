@@ -1255,8 +1255,6 @@ def optimizer_update_readam_1D(
         skip_zeros,
     )
 
-    # import pdb; pdb.set_trace()
-
 
 def optimizer_update_readam(
     g: Tensor,
@@ -1264,7 +1262,11 @@ def optimizer_update_readam(
     state1: Tensor,
     state2_row: Tensor,
     state2_col: Tensor,
+    state2_mean: Tensor,
+    state2_accum: Optional[torch.Tensor],
     optim_bits: int,
+    packing_aligns: bool,
+    dims: tuple[int, int, int, int],
     beta1: float,
     beta2: float,
     eps: float,
@@ -1275,17 +1277,40 @@ def optimizer_update_readam(
     gnorm_scale: float = 1.0,
     skip_zeros=False,
 ) -> None:
-    """
-    NOTE: Here, we deliberately chose to split ReAdam's operations into (1) a custom kernel that updates weight and U (state1), and (2) a native torch
-    implementation that updates adafactor's statistics. We do this because designing a thread launch configuration that can cater to all weight shapes
-    such as lean matrices, and perform the reduction over both row and column causes thread under-utilization, requires collaborative writes across
-    thread-blocks, and needs extra memory. Overall, separating felt a more logical choice which keeps the code simple and clean, and has minimal overhead.
-    """
-    is_on_gpu([p, g, state1, state2_row, state2_col])
-    if g.numel() >= 2**31:
+    is_on_gpu([p, g, state1, state2_row, state2_col, state2_mean, state2_accum])
+    if dims[0] >= 2**31:
         raise ValueError(
             f"ReAdam kernels use 32-bit indexing and support at most 2**31 - 1 elements per tensor, got {g.numel()}"
         )
+    if packing_aligns:
+        # for bit-packing to work, we want each thread to operate on 8/optim_bits elements. In tiling, if they dont align, then two threads will write to the same location. For such cases, we use the slower decoupled updates
+
+        state2_accum_row = state2_accum[: dims[1] * dims[2]]
+        state2_accum_col = state2_accum[dims[1] * dims[2] : dims[1] * (dims[2] + dims[3])]
+
+        torch.ops.bitsandbytes.optimizer_update_readam_fused(
+            g,
+            p,
+            state1,
+            state2_row,
+            state2_col,
+            state2_mean,
+            state2_accum_row,
+            state2_accum_col,
+            optim_bits,
+            dims,
+            beta1,
+            beta2,
+            eps,
+            step,
+            lr,
+            weight_decay,
+            decay_ratio,
+            gnorm_scale,
+            skip_zeros,
+        )
+
+        return
 
     torch.ops.bitsandbytes.optimizer_update_readam(
         g,
@@ -1293,7 +1318,7 @@ def optimizer_update_readam(
         state1,
         state2_row,
         state2_col,
-        state2_row.mean(dim=-2),
+        state2_mean,
         optim_bits,
         beta1,
         beta2,
@@ -1320,8 +1345,7 @@ def optimizer_update_readam(
         torch.linalg.vector_norm(g, dim=-2, keepdim=True, dtype=torch.float32).square_().div_(g.size(-2)),
         one_minus_beta2,
     )
-
-    # import pdb; pdb.set_trace()
+    state2_mean.copy_(state2_row.mean(dim=-2))
 
 
 @deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)

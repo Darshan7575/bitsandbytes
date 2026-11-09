@@ -126,7 +126,15 @@ template <typename T, int OPTIMIZER_BITS>
 void optimizerStaticReadam(
     T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean, float beta1,
     float beta2, float eps, int step, float lr, float weight_decay, float decay_ratio, const float gnorm_scale,
-    bool skip_zeros, int n, int n_rows, int n_cols
+    bool skip_zeros, int n, int n_rows_per_batch, int n_cols_per_batch
+);
+
+template <typename T, int OPTIMIZER_BITS>
+void optimizerStaticReadamFused(
+    T* p, T* g, unsigned char* state1, float* state2_row, float* state2_col, float* state2_mean,
+    float* state2_accum_row, float* state2_accum_col, float beta1, float beta2, float eps, int step, float lr,
+    float weight_decay, float decay_ratio, const float gnorm_scale, bool skip_zeros, int n, int n_batch,
+    int n_rows_per_batch, int n_cols_per_batch
 );
 
 void gemmex(

@@ -38,11 +38,21 @@ class OptimizerQuantized(BaseOptimizer8bit):
             "state2",  # fallback buffer for storing full S_t for 1D params where adafactor factorization is not possible
             "state2_row",  # buffer for row sum of adafactor compressed second moment
             "state2_col",  # buffer for column sum of adafactor compressed second moment
+            "state2_mean",  # buffer for the mean used as denominator in adafactor compression
             "absmax2",
             "unorm_vec",  # update norm scales
         }
 
         self.fill_qmap()
+
+        self._stats_accums = {}
+
+    def get_stats_accum(self, n, device):
+        buf = self._stats_accums.get(device)
+        if buf is None or buf.numel() < n:
+            buf = torch.zeros(n, dtype=torch.float32, device=device)
+            self._stats_accums[device] = buf
+        return buf
 
     def fill_qmap(self):
         self.name2qmap["udynamic"] = F.create_dynamic_map(signed=False)
@@ -81,6 +91,9 @@ class OptimizerQuantized(BaseOptimizer8bit):
         elif factor == "row":
             shape[-1] = 1
         elif factor == "col":
+            shape[-2] = 1
+        elif factor == "all":
+            shape[-1] = 1
             shape[-2] = 1
         else:
             raise ValueError(f"Invalid factor value: {factor}")
@@ -219,7 +232,9 @@ class Optimizer2State(OptimizerQuantized):
                 # TODO (darshan): In theory, these row/column stats can be quantized, but the memory gain is very marginal with additional compute overhead, and is not worth the effort.
                 state["state2_row"] = self.get_state_buffer(p, dtype=torch.float32, factor="row")
                 state["state2_col"] = self.get_state_buffer(p, dtype=torch.float32, factor="col")
+                state["state2_mean"] = self.get_state_buffer(p, dtype=torch.float32, factor="all")
             else:
+                # TODO: Introduce 4 bit LPMM style quantization for state2 instead of 8-bit to further reduce memory.
                 if state["step"] == 0:
                     if "udynamic" not in self.name2qmap:
                         self.fill_qmap()
@@ -301,13 +316,25 @@ class Optimizer2State(OptimizerQuantized):
                     skip_zeros=config["skip_zeros"],
                 )
             elif "state2_row" in state:
+                # we think of the N-D weights as a 3D tensor with (batch, n_rows_per_batch, n_cols_per_batch)
+                n, n_rows_per_batch, n_cols_per_batch = grad.numel(), grad.size(-2), grad.size(-1)
+                n_batch = grad.numel() // (n_rows_per_batch * n_cols_per_batch)
+
+                packing_aligns = n_cols_per_batch % (8 // config["optim_bits"]) == 0
+
                 F.optimizer_update_readam(
                     grad,
                     p,
                     state["state1"],
                     state["state2_row"],
                     state["state2_col"],
+                    state["state2_mean"],
+                    self.get_stats_accum(n_batch * (n_rows_per_batch + n_cols_per_batch), p.device)
+                    if packing_aligns
+                    else None,
                     config["optim_bits"],
+                    packing_aligns,
+                    (n, n_batch, n_rows_per_batch, n_cols_per_batch),
                     config["betas"][0],
                     config["betas"][1],
                     config["eps"],
@@ -330,6 +357,7 @@ class ReAdamW(Optimizer2State):
         weight_decay=1e-2,
         optim_bits=4,
         decay_ratio=10.0,
+        adafactor=False,
         args=None,
         min_quant_size=4096,
         is_paged=False,
@@ -355,6 +383,8 @@ class ReAdamW(Optimizer2State):
                 The number of bits of the optimizer state. Should be one of [2, 4, 8].
             decay_ratio (`float`, defaults to 10.0):
                 The threshold for the ratio between `U_t` and `Z_t` beyond which a co-ordinate is considered to be in the decay regime.
+            adafactor (`bool`, defaults to `False`):
+                Whether to use the [Adafactor](https://arxiv.org/abs/1804.04235) style compression for scale.
             args (`object`, defaults to `None`):
                 An object with additional arguments.
             min_quant_size (`int`, defaults to 4096):
@@ -371,6 +401,7 @@ class ReAdamW(Optimizer2State):
             weight_decay,
             optim_bits,
             decay_ratio,
+            adafactor,
             args,
             min_quant_size,
             is_paged=is_paged,
