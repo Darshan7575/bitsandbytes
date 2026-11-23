@@ -1508,7 +1508,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam1D(
 
                     float denom = sqrtf(1.0f - bt + (bt * z_val * z_val));
 
-                    s1_vals[j] = __fdividef(((1.0f - at) * s1_vals[j]) + (at * z_val), denom + eps);
+                    s1_vals[j] = __fdividef(s1_vals[j] + (at * (z_val - s1_vals[j])), denom + eps);
                     s2_vals[j] = (s2_vals[j] == 0.0f) ? (sqrtf(bt) * fabsf(g_vals[j])) : (s2_vals[j] * denom);
 
                     s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
@@ -1692,7 +1692,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStaticReadam(
                     z_val = __fdividef(g_vals[j], s2_val + eps);
 
                     s1_vals[j] = __fdividef(
-                        ((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
+                        s1_vals[j] + (at * (z_val - s1_vals[j])), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
                     );
                     s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
                 }
@@ -1886,8 +1886,7 @@ __launch_bounds__(NUM_THREADS, 3) __global__ void kOptimizerStaticReadamFused(
 
                             // lerp for numerator
                             s1_vals[j] = __fdividef(
-                                (s1_vals[j]) + ((1 - at) * (z_val - s1_vals[j])),
-                                sqrtf(1 - bt + (bt * z_val * z_val)) + eps
+                                (s1_vals[j]) + (at * (z_val - s1_vals[j])), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
                             );
                             s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
                         }

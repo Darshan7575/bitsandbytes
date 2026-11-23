@@ -663,7 +663,7 @@ def _optimizer_update_readam_cpu(
         scale = grad.abs().add_(eps)  # or we could keep it all zeros.
     else:
         bias_correction2_prev = 1 - beta2 ** (step - 1)
-        squared_scale_prev = torch.mul((state2_row / state2_mean).unsqueeze(-1), state2_col.unsqueeze(-2))
+        squared_scale_prev = torch.mul((state2_row / state2_mean), state2_col)
         bias_correction2_prev_sqrt = math.sqrt(bias_correction2_prev)
         scale = (squared_scale_prev.sqrt() / bias_correction2_prev_sqrt).add_(eps)
 
