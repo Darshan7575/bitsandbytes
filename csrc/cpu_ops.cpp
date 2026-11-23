@@ -485,6 +485,49 @@ void dequantizeBlockwise8bitCpu(
     }
 }
 
+template <typename T> void dequantizeReadamUpdateCpu(unsigned char* A, T* out, int optim_bits, float eps, long long n) {
+    if (n <= 0)
+        return;
+
+    const int N_PER_ELEM = 8 / optim_bits;
+    const unsigned char PACKED_MASK = (1 << optim_bits) - 1;
+    const int SIGN_BIT = 1 << (optim_bits - 1);
+    const int MAG_LOG_LEVELS = 1 << (optim_bits - 2);
+    const int MAG_LIN_LEVELS = 1 << (optim_bits - 2);
+
+    float levels[128];
+
+    BNB_OMP_PARALLEL_FOR
+    for (int id = 0; id < (MAG_LOG_LEVELS + MAG_LIN_LEVELS); ++id) {
+        if (id < MAG_LOG_LEVELS)
+            levels[id] = (MAG_LOG_LEVELS == 1)
+                             ? eps
+                             : expf(logf(eps) + ((float)id / (MAG_LOG_LEVELS - 1)) * (logf(0.1f) - logf(eps)));
+        else
+            levels[id] = 0.1f + 0.9f * (float)(id - MAG_LIN_LEVELS + 1) / MAG_LIN_LEVELS;
+    }
+
+    BNB_OMP_PARALLEL_FOR
+    for (long long i = 0; i < n; i += 1) {
+        long long i_packed = i / N_PER_ELEM;
+        int ind = i % N_PER_ELEM;
+
+        unsigned char val_ind = (A[i_packed] >> (ind * optim_bits)) & PACKED_MASK;
+
+        unsigned char mag_id = val_ind & (SIGN_BIT - 1);
+
+        float v = (val_ind & SIGN_BIT) ? -levels[mag_id] : levels[mag_id];
+
+        if constexpr (std::is_same<T, bf16_t>::value) {
+            out[i] = float_to_bf16(v);
+        } else if constexpr (std::is_same<T, fp16_t>::value) {
+            out[i] = float_to_fp16(v);
+        } else {
+            out[i] = static_cast<T>(v);
+        }
+    }
+}
+
 // Prevent GCC/Clang from emitting EVEX-encoded AVX512 instructions in plain scalar code.
 // The global -mavx512vl flag can cause GCC to fold broadcasts into EVEX encoding (e.g. vmulps {1to4})
 // which would SIGILL on non-AVX512 CPUs like Zen3. These functions are scalar C++ and don't need AVX512.
@@ -664,6 +707,73 @@ void quantize_cpu_impl(float* code, const T* A, float* absmax, unsigned char* ou
     }
 }
 
+template <typename T>
+void quantizeReadamUpdateCpu(T* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n) {
+    if (n <= 0)
+        return;
+
+    const int N_PER_ELEM = 8 / optim_bits;
+    const long long n_packed = (n + N_PER_ELEM - 1) / N_PER_ELEM;
+
+    const int SIGN_BIT = 1 << (optim_bits - 1);
+    const int MAG_LOG_LEVELS = 1 << (optim_bits - 2);
+    const int MAG_LIN_LEVELS = 1 << (optim_bits - 2);
+
+    const float log_eps = logf(eps);
+    const float log_denom = logf(0.1f) - logf(eps);
+
+    BNB_OMP_PARALLEL_FOR
+    for (long long i_packed = 0; i_packed < n_packed; i_packed += 1) {
+        long long i = i_packed * N_PER_ELEM;
+
+        unsigned char packed_byte = 0;
+
+        for (int idx = 0; idx < N_PER_ELEM; idx += 1) {
+            long long curr_ind = i + idx;
+
+            if (curr_ind >= n)
+                break;
+
+            float val;
+            if constexpr (std::is_same<T, float>::value)
+                val = A[curr_ind];
+            else if constexpr (std::is_same<T, bf16_t>::value)
+                val = bf16_to_float(A[curr_ind].v);
+            else
+                val = fp16_to_float(A[curr_ind].v);
+
+            bool is_negative = val < 0.0f;
+            // Clamp magnitude to [eps, 1.0f]
+            float mag = fminf(fmaxf(fabsf(val), eps), 1.0f);
+
+            int mag_id;
+            if (MAG_LOG_LEVELS == 1) {
+                // 2-bit: levels {eps, 1.0}, pick the nearest one.
+                mag_id = mag > 0.5f ? 1 : 0;
+            } else if (mag <= 0.1f) {
+                // Log region: round in log space to one of the N levels in [eps, 0.1].
+                float t = (logf(mag) - log_eps) / log_denom;
+                mag_id = std::min((int)roundf(t * (MAG_LOG_LEVELS - 1)), MAG_LOG_LEVELS - 1);
+            } else {
+                // Linear region: m = 0 corresponds to 0.1 (the top log level, id N-1), m = 1..N to ids N..2N-1.
+                int m = (int)roundf((mag - 0.1f) * (MAG_LIN_LEVELS / 0.9f));
+                mag_id = MAG_LOG_LEVELS - 1 + std::min(m, MAG_LIN_LEVELS);
+            }
+
+            // incase the coordinate is in the decay regime, move one step closer towards zero (paper eq. 7).
+            mag_id = (decay_mask[curr_ind] && mag_id > 0) ? mag_id - 1 : mag_id;
+
+            unsigned char val_ind = (unsigned char)mag_id;
+            if (is_negative)
+                val_ind |= SIGN_BIT;
+
+            packed_byte |= (val_ind << (idx * optim_bits));
+        }
+
+        out[i_packed] = packed_byte;
+    }
+}
+
 void quantize_cpu(float* code, float* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
     quantize_cpu_impl<float>(code, A, absmax, out, blocksize, n);
 }
@@ -675,6 +785,16 @@ void quantize_cpu_bf16(float* code, bf16_t* A, float* absmax, unsigned char* out
 void quantize_cpu_fp16(float* code, fp16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
     quantize_cpu_impl<fp16_t>(code, A, absmax, out, blocksize, n);
 }
+
+template void quantizeReadamUpdateCpu<float>(
+    float* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+);
+template void quantizeReadamUpdateCpu<fp16_t>(
+    fp16_t* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+);
+template void quantizeReadamUpdateCpu<bf16_t>(
+    bf16_t* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+);
 
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #pragma GCC pop_options
@@ -949,6 +1069,10 @@ template void dequantizeBlockwise4bitCpu<bf16_t, FP4>(
 template void dequantizeBlockwise4bitCpu<bf16_t, NF4>(
     unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long m, long long n
 );
+
+template void dequantizeReadamUpdateCpu<float>(unsigned char* A, float* out, int optim_bits, float eps, long long n);
+template void dequantizeReadamUpdateCpu<fp16_t>(unsigned char* A, fp16_t* out, int optim_bits, float eps, long long n);
+template void dequantizeReadamUpdateCpu<bf16_t>(unsigned char* A, bf16_t* out, int optim_bits, float eps, long long n);
 
 #if defined(__AVX512F__) && defined(__AVX512BF16__)
 template void gemv_4bit_inference<bf16_t, FP4>(

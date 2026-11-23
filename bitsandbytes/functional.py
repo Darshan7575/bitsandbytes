@@ -1265,7 +1265,7 @@ def optimizer_update_readam(
     state2_mean: Tensor,
     state2_accum: Optional[torch.Tensor],
     optim_bits: int,
-    packing_aligns: bool,
+    use_fused: bool,
     dims: tuple[int, int, int, int],
     beta1: float,
     beta2: float,
@@ -1282,7 +1282,7 @@ def optimizer_update_readam(
         raise ValueError(
             f"ReAdam kernels use 32-bit indexing and support at most 2**31 - 1 elements per tensor, got {g.numel()}"
         )
-    if packing_aligns:
+    if use_fused:
         # for bit-packing to work, we want each thread to operate on 8/optim_bits elements. In tiling, if they dont align, then two threads will write to the same location. For such cases, we use the slower decoupled updates
 
         state2_accum_row = state2_accum[: dims[1] * dims[2]]
@@ -1330,22 +1330,6 @@ def optimizer_update_readam(
         gnorm_scale,
         skip_zeros,
     )
-
-    # import pdb; pdb.set_trace()
-
-    # updating adafactor's statistics. (borrowed from: https://github.com/pytorch/pytorch/blob/v2.14.0/torch/optim/_adafactor.py)
-    one_minus_beta2 = 1 - beta2
-    # Accumulate in fp32: in fp16 the squared row norm overflows for norms > 256, and lerp_ into the fp32 state buffers
-    # needs a fp32 operand.
-    state2_row.lerp_(
-        torch.linalg.vector_norm(g, dim=-1, keepdim=True, dtype=torch.float32).square_().div_(g.size(-1)),
-        one_minus_beta2,
-    )
-    state2_col.lerp_(
-        torch.linalg.vector_norm(g, dim=-2, keepdim=True, dtype=torch.float32).square_().div_(g.size(-2)),
-        one_minus_beta2,
-    )
-    state2_mean.copy_(state2_row.mean(dim=-2))
 
 
 @deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)

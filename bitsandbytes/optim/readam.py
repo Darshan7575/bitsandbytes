@@ -81,8 +81,23 @@ class OptimizerQuantized(BaseOptimizer8bit):
 
         return config
 
-    def get_state_buffer(self, p, dtype=torch.float32, optim_bits=8, factor=None):
-        shape = list(p.shape)
+    @staticmethod
+    def factored_shape(shape):
+        """
+        Shape that the Adafactor-style factorization of S works on: (..., n_rows, n_cols), factored over the last two dims.
+
+        Factoring stores (n_rows + n_cols + 1) fp32 values per n_rows x n_cols matrix. For conv kernels
+        (out, in, kh, kw) the trailing kh x kw matrices are tiny (3x3: 7/9 fp32 per element, ~25 bits/param), so those
+        tensors are factored as one (out, in*kh*kw) matrix instead. Batched matrices with large trailing dims
+        (e.g. MoE experts (E, out, in)) keep the per-matrix factorization.
+        """
+        shape = tuple(shape)
+        if len(shape) > 2 and shape[-2] * shape[-1] < 1024:
+            return (shape[0], prod(shape[1:]))
+        return shape
+
+    def get_state_buffer(self, p, dtype=torch.float32, optim_bits=8, factor=None, shape=None):
+        shape = list(p.shape if shape is None else shape)
         if factor is None:
             if dtype == torch.uint8:
                 # For state1, when we use 2/4 bits, we need to pack them into 8 bits (uint8). The size of unified memory needs to be updated accordingly.
@@ -225,15 +240,19 @@ class Optimizer2State(OptimizerQuantized):
         state["step"] = 0
 
         if p.numel() >= config["min_quant_size"]:
-            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8, optim_bits=config["optim_bits"])
-
             if (p.dim() > 1) and config["adafactor"]:
-                # do adafactor compression only if the param is not 1D and has size greater than the minimum size required for quantization
-                # TODO (darshan): In theory, these row/column stats can be quantized, but the memory gain is very marginal with additional compute overhead, and is not worth the effort.
-                state["state2_row"] = self.get_state_buffer(p, dtype=torch.float32, factor="row")
-                state["state2_col"] = self.get_state_buffer(p, dtype=torch.float32, factor="col")
-                state["state2_mean"] = self.get_state_buffer(p, dtype=torch.float32, factor="all")
+                # all buffers use the factored shape: state1 is bit-packed along its last dim, which must match the
+                # n_cols the kernels see
+                fshape = self.factored_shape(p.shape)
+                state["state1"] = self.get_state_buffer(
+                    p, dtype=torch.uint8, optim_bits=config["optim_bits"], shape=fshape
+                )
+                state["state2_row"] = self.get_state_buffer(p, dtype=torch.float32, factor="row", shape=fshape)
+                state["state2_col"] = self.get_state_buffer(p, dtype=torch.float32, factor="col", shape=fshape)
+                state["state2_mean"] = self.get_state_buffer(p, dtype=torch.float32, factor="all", shape=fshape)
             else:
+                state["state1"] = self.get_state_buffer(p, dtype=torch.uint8, optim_bits=config["optim_bits"])
+
                 # TODO: Introduce 4 bit LPMM style quantization for state2 instead of 8-bit to further reduce memory.
                 if state["step"] == 0:
                     if "udynamic" not in self.name2qmap:
@@ -316,24 +335,31 @@ class Optimizer2State(OptimizerQuantized):
                     skip_zeros=config["skip_zeros"],
                 )
             elif "state2_row" in state:
-                # we think of the N-D weights as a 3D tensor with (batch, n_rows_per_batch, n_cols_per_batch)
+                # we think of the N-D weights as a 3D tensor with (batch, n_rows_per_batch, n_cols_per_batch); conv
+                # kernels are viewed as one (out, in*kh*kw) matrix (see factored_shape). p and grad are contiguous
+                # (above), so the views share their memory and the kernels update p in place.
+                fshape = self.factored_shape(p.shape)
+                grad = grad.view(fshape)
+                p_view = p.data.view(fshape)
                 n, n_rows_per_batch, n_cols_per_batch = grad.numel(), grad.size(-2), grad.size(-1)
+
                 n_batch = grad.numel() // (n_rows_per_batch * n_cols_per_batch)
 
-                packing_aligns = n_cols_per_batch % (8 // config["optim_bits"]) == 0
+                # Fused kernel works only for CUDA.
+                used_fused = (n_cols_per_batch % (8 // config["optim_bits"]) == 0) and grad.is_cuda
 
                 F.optimizer_update_readam(
                     grad,
-                    p,
+                    p_view,
                     state["state1"],
                     state["state2_row"],
                     state["state2_col"],
                     state["state2_mean"],
                     self.get_stats_accum(n_batch * (n_rows_per_batch + n_cols_per_batch), p.device)
-                    if packing_aligns
+                    if used_fused
                     else None,
                     config["optim_bits"],
-                    packing_aligns,
+                    used_fused,
                     (n, n_batch, n_rows_per_batch, n_cols_per_batch),
                     config["betas"][0],
                     config["betas"][1],

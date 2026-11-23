@@ -2,7 +2,6 @@ from collections.abc import Sequence
 import ctypes as ct
 import logging
 import math
-from math import prod
 from typing import Optional
 
 import torch
@@ -136,107 +135,88 @@ if not isinstance(lib, ErrorHandlerMockBNBNativeLibrary):
 
         return out
 
-    @register_kernel("bitsandbytes::dequantize_4bit", "cpu")
-    def _(
-        A: torch.Tensor,
-        absmax: torch.Tensor,
-        blocksize: int,
-        quant_type: str,
-        shape: Sequence[int],
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        # Fallback as AVX512 implementation has accuracy issues with blocksize >= 2048.
-        # Note: this is not a common use case.
-        avx512_fallback = _has_avx512 and blocksize >= 2048
+    @register_kernel("bitsandbytes::quantize_readam_update", "cpu")
+    def _(A: torch.Tensor, decay_mask: torch.Tensor, optim_bits: int, eps: float) -> torch.Tensor:
+        A = A.contiguous()
+        decay_mask = decay_mask.to(torch.bool).contiguous()
+        n = A.numel()
 
-        # Odd shape is not supported by this kernel; fallback to generic implementation
-        shape_fallback = shape[-1] % 2 != 0
+        shape = list(A.shape)
+        k = 8 // optim_bits
+        shape[-1] = math.ceil(shape[-1] / k)
+        out = torch.zeros(shape, device=A.device, dtype=torch.uint8)
 
-        if avx512_fallback or shape_fallback:
-            from ..default.ops import _dequantize_4bit_compute
-            from ..utils import _get_4bit_code
+        fns = {
+            torch.float32: lib.cquantize_readam_update_cpu_fp32,
+            torch.bfloat16: lib.cquantize_readam_update_cpu_bf16,
+            torch.float16: lib.cquantize_readam_update_cpu_fp16,
+        }
+        if A.dtype in fns:
+            fns[A.dtype](
+                get_ptr(A),
+                get_ptr(decay_mask),
+                get_ptr(out),
+                ct.c_int32(optim_bits),
+                ct.c_float(eps),
+                ct.c_longlong(n),
+            )
+            return out
 
-            if A.dtype != torch.uint8:
-                A = A.view(torch.uint8)
-            code = _get_4bit_code(quant_type, A.device)
-            return _dequantize_4bit_compute(A.reshape(-1), absmax, code, blocksize, shape, dtype)
-
-        # Enable non uint8 dtype
-        if A.dtype != torch.uint8:
-            A = A.view(torch.uint8)
-
-        # TODO: support half precision absmax
-        if absmax.dtype != torch.float32:
-            absmax = absmax.float()
-
-        if len(shape) == 1:
-            shape = (1, shape[0])
-
-        m = prod(shape[:-1])
-        n = shape[-1]
-
-        A = A.reshape(m, n // 2)
-        out = torch.empty(shape, dtype=dtype, device=A.device)
-
-        if quant_type == "fp4":
-            if dtype == torch.float32:
-                lib.cdequantize_blockwise_cpu_fp4_fp32(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
-            elif dtype == torch.bfloat16:
-                lib.cdequantize_blockwise_cpu_fp4_bf16(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
-            elif dtype == torch.float16:
-                lib.cdequantize_blockwise_cpu_fp4_fp16(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
-        elif quant_type == "nf4":
-            if dtype == torch.float32:
-                lib.cdequantize_blockwise_cpu_nf4_fp32(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
-            elif dtype == torch.bfloat16:
-                lib.cdequantize_blockwise_cpu_nf4_bf16(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
-            elif dtype == torch.float16:
-                lib.cdequantize_blockwise_cpu_nf4_fp16(
-                    get_ptr(A),
-                    get_ptr(absmax),
-                    get_ptr(out),
-                    ct.c_longlong(blocksize),
-                    ct.c_longlong(m),
-                    ct.c_longlong(n),
-                )
+        # generic fallback (e.g. float64): same logic in torch
+        n_levels, sign_bit = 1 << (optim_bits - 2), 1 << (optim_bits - 1)
+        u = A.reshape(-1).float()
+        mask = decay_mask.reshape(-1)
+        mag = u.abs().clamp(min=eps, max=1.0)
+        if n_levels == 1:
+            mag_id = (mag > 0.5).to(torch.int32)
         else:
-            raise ValueError
+            t = (mag.log() - math.log(eps)) / (math.log(0.1) - math.log(eps))
+            log_id = torch.floor(t * (n_levels - 1) + 0.5).clamp(max=n_levels - 1)
+            m = torch.floor((mag - 0.1) * (n_levels / 0.9) + 0.5).clamp(max=n_levels)
+            mag_id = torch.where(mag <= 0.1, log_id, (n_levels - 1) + m).to(torch.int32)
+        mag_id = torch.where(mask & (mag_id > 0), mag_id - 1, mag_id)
+        code = mag_id | torch.where(u < 0, sign_bit, 0).to(torch.int32)
 
+        n_bytes = (n + k - 1) // k
+        if n_bytes * k > n:
+            code = torch.cat([code, code.new_zeros(n_bytes * k - n)])
+        shifts = torch.arange(k, dtype=torch.int32, device=code.device) * optim_bits
+        packed = (code.view(n_bytes, k) << shifts).sum(dim=1)
+        out.view(-1)[:n_bytes].copy_(packed.to(torch.uint8))
+        return out
+
+    @register_kernel("bitsandbytes::dequantize_readam_update", "cpu")
+    def _(A: torch.Tensor, shape: list, optim_bits: int, eps: float, dtype: torch.dtype) -> torch.Tensor:
+        A = A.contiguous()
+        k = 8 // optim_bits
+        n = math.prod(shape)
+        out = torch.empty(shape, device=A.device, dtype=dtype)
+
+        fns = {
+            torch.float32: lib.cdequantize_readam_update_cpu_fp32,
+            torch.bfloat16: lib.cdequantize_readam_update_cpu_bf16,
+            torch.float16: lib.cdequantize_readam_update_cpu_fp16,
+        }
+        if dtype in fns:
+            fns[dtype](get_ptr(A), get_ptr(out), ct.c_int32(optim_bits), ct.c_float(eps), ct.c_longlong(n))
+            return out
+
+        # generic fallback (e.g. float64)
+        sign_bit = 1 << (optim_bits - 1)
+        n_bytes = (n + k - 1) // k
+        packed = A.reshape(-1)[:n_bytes].to(torch.int32)
+        shifts = torch.arange(k, dtype=torch.int32, device=A.device) * optim_bits
+        code = ((packed.unsqueeze(1) >> shifts) & ((1 << optim_bits) - 1)).reshape(-1)[:n]
+
+        n_levels = 1 << (optim_bits - 2)
+        if n_levels == 1:
+            log_levels = torch.tensor([eps], dtype=torch.float32, device=A.device)
+        else:
+            ls = torch.arange(n_levels, dtype=torch.float32, device=A.device)
+            log_levels = torch.exp(math.log(eps) + (ls / (n_levels - 1)) * (math.log(0.1) - math.log(eps)))
+        lin_levels = 0.1 + 0.9 * torch.arange(1, n_levels + 1, dtype=torch.float32, device=A.device) / n_levels
+        mag = torch.cat([log_levels, lin_levels])[code & (sign_bit - 1)]
+        out.copy_(torch.where((code & sign_bit) != 0, -mag, mag).view(shape))
         return out
 
     if has_avx512bf16():
@@ -466,6 +446,20 @@ def _quant_blockwise_fp32_direct(
     absmax_out.copy_(absmax)
 
 
+@torch.no_grad()
+def _dequant_readam_update_fp32_direct(
+    A_uint8: torch.Tensor, shape: list, optim_bits: int, eps: float
+) -> torch.Tensor:
+    return torch.ops.bitsandbytes.dequantize_readam_update(A_uint8, shape, optim_bits, eps, torch.float32)
+
+
+def _quant_readam_update_fp32_direct(
+    A_fp32: torch.Tensor, out_uint8: torch.Tensor, decay_mask: torch.Tensor, optim_bits: int, eps: float
+) -> None:
+    out = torch.ops.bitsandbytes.quantize_readam_update(A_fp32, decay_mask, optim_bits, eps)
+    out_uint8.copy_(out)
+
+
 def _optimizer_update_8bit_blockwise_cpu(
     optimizer_name: str,
     g: torch.Tensor,
@@ -577,4 +571,136 @@ def _optimizer_update_8bit_blockwise_cpu(
             _quant_blockwise_fp32_direct(state2_fp32, qmap2, absmax2, state2, blocksize)
 
 
+def _optimizer_update_readam_1D_cpu(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap2: torch.Tensor,
+    absmax2: torch.Tensor,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    blocksize = 256
+
+    # Dequantize states
+    state1_fp32 = _dequant_readam_update_fp32_direct(state1, g.shape, optim_bits, eps)
+    state2_fp32 = None
+    if state2 is not None and qmap2 is not None and absmax2 is not None:
+        state2_fp32 = _dequant_blockwise_fp32_direct(state2, absmax2, qmap2, blocksize)
+
+    grad = g.float() * gnorm_scale
+    p_fp32 = p.data.float()
+
+    # Step 1: Calculate the scale s_{t-1} for the current step
+    if step == 1:
+        scale = grad.abs().add_(eps)  # or we could keep it all zeros.
+    else:
+        bias_correction2_prev = 1 - beta2 ** (step - 1)
+        bias_correction2_prev_sqrt = math.sqrt(bias_correction2_prev)
+        scale = (state2_fp32.sqrt() / bias_correction2_prev_sqrt).add_(eps)
+
+    state2_fp32.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+    grad.div_(scale)  # -> z_t
+
+    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
+
+    # Step 3: Update U
+    a_t = (1 - beta1) / (1 - beta1**step)
+    b_t = (1 - beta2) / (1 - beta2**step)
+
+    state1_fp32.lerp_(grad, a_t)  # -> (1 - a_t) * U_t + a_t * z_t
+
+    denom = (1 - b_t + b_t * grad.square()).sqrt().add_(eps)
+    state1_fp32.div_(denom)
+
+    if weight_decay > 0.0:
+        p_fp32.mul_(1.0 - lr * weight_decay)
+    p_fp32.add_(state1_fp32, alpha=-lr)
+
+    p.data.copy_(p_fp32)
+
+    # Re-quantize states
+    _quant_readam_update_fp32_direct(state1_fp32, state1, decay_mask, optim_bits, eps)
+    _quant_blockwise_fp32_direct(state2_fp32, qmap2, absmax2, state2, blocksize)
+
+
+def _optimizer_update_readam_cpu(
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2_row: torch.Tensor,
+    state2_col: torch.Tensor,
+    state2_mean: torch.Tensor,
+    optim_bits: int,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    weight_decay: float,
+    decay_ratio: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    # Dequantize states
+    state1_fp32 = _dequant_readam_update_fp32_direct(state1, g.shape, optim_bits, eps)
+
+    grad = g.float() * gnorm_scale
+    p_fp32 = p.data.float()
+
+    # Step 1: Calculate the scale s_{t-1} for the current step
+    if step == 1:
+        scale = grad.abs().add_(eps)  # or we could keep it all zeros.
+    else:
+        bias_correction2_prev = 1 - beta2 ** (step - 1)
+        squared_scale_prev = torch.mul((state2_row / state2_mean).unsqueeze(-1), state2_col.unsqueeze(-2))
+        bias_correction2_prev_sqrt = math.sqrt(bias_correction2_prev)
+        scale = (squared_scale_prev.sqrt() / bias_correction2_prev_sqrt).add_(eps)
+
+    one_minus_beta2 = 1 - beta2
+    state2_row.lerp_(
+        torch.linalg.vector_norm(g, dim=-1, keepdim=True, dtype=torch.float32).square_().div_(g.size(-1)),
+        one_minus_beta2,
+    )
+    state2_col.lerp_(
+        torch.linalg.vector_norm(g, dim=-2, keepdim=True, dtype=torch.float32).square_().div_(g.size(-2)),
+        one_minus_beta2,
+    )
+    state2_mean.copy_(state2_row.mean(dim=-2, keepdim=True))
+
+    grad.div_(scale)  # -> z_t
+
+    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
+
+    # Step 3: Update U
+    a_t = (1 - beta1) / (1 - beta1**step)
+    b_t = (1 - beta2) / (1 - beta2**step)
+
+    state1_fp32.lerp_(grad, a_t)  # -> (1 - a_t) * U_t + a_t * z_t
+
+    denom = (1 - b_t + b_t * grad.square()).sqrt().add_(eps)
+    state1_fp32.div_(denom)
+
+    if weight_decay > 0.0:
+        p_fp32.mul_(1.0 - lr * weight_decay)
+    p_fp32.add_(state1_fp32, alpha=-lr)
+
+    p.data.copy_(p_fp32)
+
+    # Re-quantize states
+    _quant_readam_update_fp32_direct(state1_fp32, state1, decay_mask, optim_bits, eps)
+
+
 register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "cpu")(_optimizer_update_8bit_blockwise_cpu)
+register_kernel("bitsandbytes::optimizer_update_readam_1D", "cpu")(_optimizer_update_readam_1D_cpu)
+register_kernel("bitsandbytes::optimizer_update_readam", "cpu")(_optimizer_update_readam_cpu)

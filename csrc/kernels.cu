@@ -1859,10 +1859,11 @@ __launch_bounds__(NUM_THREADS, 3) __global__ void kOptimizerStaticReadamFused(
 
 #pragma unroll N_PER_TH
                 for (int j = 0; j < N_PER_TH; j++) {
-                    if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                    float g_f = (float)g_vals[j];
+
+                    if (!isnan(g_f) && !isinf(g_f)) {
                         s1_vals[j] = dequantize_update<OPTIMIZER_BITS>(c1s[0], j, eps);
 
-                        float g_f = (float)g_vals[j];
                         g_f *= gnorm_scale;
 
                         if (step == 1) {
@@ -1883,8 +1884,10 @@ __launch_bounds__(NUM_THREADS, 3) __global__ void kOptimizerStaticReadamFused(
 
                             z_val = __fdividef(g_f, s2_val + eps);
 
+                            // lerp for numerator
                             s1_vals[j] = __fdividef(
-                                ((1.0f - at) * s1_vals[j]) + (at * z_val), sqrtf(1 - bt + (bt * z_val * z_val)) + eps
+                                (s1_vals[j]) + ((1 - at) * (z_val - s1_vals[j])),
+                                sqrtf(1 - bt + (bt * z_val * z_val)) + eps
                             );
                             s1_in_decay[j] = (fabsf(s1_vals[j]) > (fabsf(z_val) * decay_ratio));
                         }

@@ -973,6 +973,37 @@ void cdequantize_blockwise_cpu_nf4_fp16(
     dequantizeBlockwise4bitCpu<fp16_t, NF4>(A, absmax, out, blocksize, m, n);
 }
 
+void cquantize_readam_update_cpu_fp32(
+    float* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+) {
+    quantizeReadamUpdateCpu<float>(A, decay_mask, out, optim_bits, eps, n);
+}
+
+void cquantize_readam_update_cpu_bf16(
+    bf16_t* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+) {
+    quantizeReadamUpdateCpu<bf16_t>(A, decay_mask, out, optim_bits, eps, n);
+}
+
+void cquantize_readam_update_cpu_fp16(
+    fp16_t* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n
+
+) {
+    quantizeReadamUpdateCpu<fp16_t>(A, decay_mask, out, optim_bits, eps, n);
+}
+
+void cdequantize_readam_update_cpu_fp32(unsigned char* A, float* out, long long optim_bits, float eps, long long n) {
+    dequantizeReadamUpdateCpu<float>(A, out, optim_bits, eps, n);
+}
+
+void cdequantize_readam_update_cpu_bf16(unsigned char* A, bf16_t* out, long long optim_bits, float eps, long long n) {
+    dequantizeReadamUpdateCpu<bf16_t>(A, out, optim_bits, eps, n);
+}
+
+void cdequantize_readam_update_cpu_fp16(unsigned char* A, fp16_t* out, long long optim_bits, float eps, long long n) {
+    dequantizeReadamUpdateCpu<fp16_t>(A, out, optim_bits, eps, n);
+}
+
 #if defined(__AVX512F__) && defined(__AVX512BF16__)
 void gemv_4bit_inference_cpu_fp4_bf16(
     int64_t M, int64_t N, int64_t K, const bf16_t* __restrict__ x, const unsigned char* __restrict__ w,

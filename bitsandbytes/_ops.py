@@ -333,6 +333,23 @@ def _(
     torch._check(out.dtype == dtype, lambda: f"Expected out.dtype == {dtype}, got {out.dtype}")
 
 
+torch.library.define(
+    "bitsandbytes::dequantize_readam_update",
+    "(Tensor A, int[] shape, int optim_bits, float eps, ScalarType dtype) -> Tensor",
+)
+
+
+@register_fake("bitsandbytes::dequantize_readam_update")
+def _(A: torch.Tensor, shape: Sequence[int], optim_bits: int, eps: float, dtype: torch.dtype) -> torch.Tensor:
+    torch._check(optim_bits in [2, 4, 8], lambda: f"optim_bits must be one of [2, 4, 8], got {optim_bits}")
+    torch._check(A.dtype == torch.uint8, lambda: f"A must be uint8, got {A.dtype}")
+    torch._check(
+        dtype in (torch.float16, torch.bfloat16, torch.float32),
+        lambda: f"ReAdam dequantization only supports 16/32-bit floats, but got {dtype}",
+    )
+    return torch.empty(shape, device=A.device, dtype=dtype)
+
+
 torch.library.define("bitsandbytes::quantize_blockwise", "(Tensor A, Tensor code, int blocksize) -> (Tensor, Tensor)")
 
 
@@ -348,6 +365,30 @@ def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor
     absmax = torch.empty((blocks,), device=A.device, dtype=torch.float32)
     out = torch.empty_like(A, dtype=torch.uint8)
     return out, absmax
+
+
+torch.library.define(
+    "bitsandbytes::quantize_readam_update", "(Tensor A, Tensor decay_mask, int optim_bits, float eps) -> Tensor"
+)
+
+
+@register_fake("bitsandbytes::quantize_readam_update")
+def _(A: torch.Tensor, decay_mask: torch.Tensor, optim_bits: int, eps: float) -> torch.Tensor:
+    torch._check(optim_bits in [2, 4, 8], lambda: f"optim_bits must be one of [2, 4, 8], got {optim_bits}")
+    torch._check(
+        A.dtype in (torch.float16, torch.bfloat16, torch.float32),
+        lambda: f"ReAdam quantization only supports 16/32-bit floats, but got {A.dtype}",
+    )
+    torch._check(
+        A.shape == decay_mask.shape, lambda: f"Expected decay_mask.shape == {A.shape}, got {decay_mask.shape}"
+    )
+
+    shape = list(A.shape)
+    k = 8 // optim_bits
+    shape[-1] = (shape[-1] + k - 1) // k
+    out = torch.empty(shape, device=A.device, dtype=torch.uint8)
+
+    return out
 
 
 torch.library.define(
@@ -653,6 +694,10 @@ def _(
     torch._check(
         g.dtype == p.dtype,
         lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    )
+    torch._check(
+        g.is_cuda,
+        lambda: f"Expected all tensors to be on CUDA to use the fused kernel, got device={g.device}",
     )
     torch._check(
         state1.dtype == torch.uint8,

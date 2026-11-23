@@ -136,6 +136,9 @@ struct bf16_t {
 void quantize_cpu_bf16(float* code, bf16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n);
 void quantize_cpu_fp16(float* code, fp16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n);
 
+template <typename T>
+void quantizeReadamUpdateCpu(T* A, bool* decay_mask, unsigned char* out, int optim_bits, float eps, long long n);
+
 static inline bf16_t float_to_bf16(float x) {
     uint32_t bits;
     std::memcpy(&bits, &x, 4);
@@ -330,6 +333,8 @@ template <typename T, int DATA_TYPE>
 void dequantizeBlockwise4bitCpu(
     unsigned char* A, const float* absmax, T* out, long long blocksize, long long m, long long n
 );
+
+template <typename T> void dequantizeReadamUpdateCpu(unsigned char* A, T* out, int optim_bits, float eps, long long n);
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
