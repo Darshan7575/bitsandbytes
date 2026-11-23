@@ -612,8 +612,6 @@ def _optimizer_update_readam_1D_cpu(
 
     grad.div_(scale)  # -> z_t
 
-    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
-
     # Step 3: Update U
     a_t = (1 - beta1) / (1 - beta1**step)
     b_t = (1 - beta2) / (1 - beta2**step)
@@ -622,6 +620,8 @@ def _optimizer_update_readam_1D_cpu(
 
     denom = (1 - b_t + b_t * grad.square()).sqrt().add_(eps)
     state1_fp32.div_(denom)
+
+    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
 
     if weight_decay > 0.0:
         p_fp32.mul_(1.0 - lr * weight_decay)
@@ -680,8 +680,6 @@ def _optimizer_update_readam_cpu(
 
     grad.div_(scale)  # -> z_t
 
-    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
-
     # Step 3: Update U
     a_t = (1 - beta1) / (1 - beta1**step)
     b_t = (1 - beta2) / (1 - beta2**step)
@@ -690,6 +688,8 @@ def _optimizer_update_readam_cpu(
 
     denom = (1 - b_t + b_t * grad.square()).sqrt().add_(eps)
     state1_fp32.div_(denom)
+
+    decay_mask = state1_fp32.abs() > decay_ratio * grad.abs()
 
     if weight_decay > 0.0:
         p_fp32.mul_(1.0 - lr * weight_decay)
